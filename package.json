@@ -1,0 +1,47 @@
+{
+  "name": "dcs-games-cw4-netcode",
+  "version": "1.0.0",
+  "description": "DCS Games CW4 — authoritative session server, sync, validation, presence, party, reconnect, delta compression, lag-comp, AOI. 173 checks / 11 suites green.",
+  "type": "module",
+  "private": true,
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "server": "node dist/server.js",
+    "server:dev": "tsx src/server.ts",
+    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke",
+    "test:mp0": "tsx tests/mp0-acceptance.test.ts",
+    "test:mp1": "tsx tests/mp1-acceptance.test.ts",
+    "test:mp2": "tsx tests/mp2-conformance.test.ts",
+    "test:inventory": "tsx tests/inventory.test.ts",
+    "test:party": "tsx tests/party-wire.test.ts",
+    "test:reconnect": "tsx tests/reconnect.test.ts",
+    "test:delta": "tsx tests/delta-compression.test.ts",
+    "test:lagcomp": "tsx tests/lag-comp.test.ts",
+    "test:aoi": "tsx tests/aoi.test.ts",
+    "test:persistence": "tsx tests/persistence-client.test.ts",
+    "test:movement": "tsx tests/movement-regression.test.ts",
+    "test:smoke": "node tests/mock-server-smoke.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "cw4_manifest": {
+    "lane": "CW4 Netcode",
+    "project": "DCS Games",
+    "owns_C4_routes": ["wss://.../play", "POST /sessions", "POST /sessions/:id/invite"],
+    "implements_contract": "C2 (contracts/netcode-protocol.json)",
+    "build_command": "npm install && npm run build",
+    "run_command": "npm start",
+    "ws_endpoint_for_cw8_cert": "ws://localhost:8090/play",
+    "port_env": "CW4_MOCK_PORT (default 8090)",
+    "checks": 173,
+    "suites": 11
+  }
+}

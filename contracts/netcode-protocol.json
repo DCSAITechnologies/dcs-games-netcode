@@ -1,0 +1,118 @@
+{
+  "$comment": "C2 netcode-protocol — DCS Games CW4. Transcribed from CW4_NETCODE_FULL.md inline spec. RECONCILE against _SHARED_Day0/contracts/netcode-protocol.json when bundle lands (ruling: light verify pass, same source).",
+  "version": "0.1.0-pre-day0-reconcile",
+  "principles": [
+    "server authoritative",
+    "clients send INTENTS only (no client-authoritative writes)",
+    "server validates -> applies -> BROADCASTS",
+    "tick 15 Hz to start",
+    "stable entity ids",
+    "every validated mutation also emits a C3 save-delta op to CW5",
+    "anti-cheat day one (no teleport/speedhack)"
+  ],
+  "tick_hz": 15,
+  "transport": "websocket",
+  "endpoint": "wss://.../play",
+  "frames": {
+    "in": {
+      "join": {
+        "type": "join",
+        "token": "string (CW1 auth token)",
+        "world_id": "string",
+        "session_id": "string (optional; join existing)"
+      },
+      "input": {
+        "type": "input",
+        "seq": "number (client sequence, for reconciliation)",
+        "move": { "x": "number", "y": "number", "z": "number" },
+        "look": { "yaw": "number", "pitch": "number" },
+        "dt": "number (client frame delta, validated against tick)"
+      },
+      "interact": {
+        "type": "interact",
+        "target_entity_id": "string",
+        "action": "string (use|open|pickup|...)"
+      },
+      "place": {
+        "type": "place",
+        "object_type": "string",
+        "position": { "x": "number", "y": "number", "z": "number" },
+        "rotation": { "yaw": "number" }
+      },
+      "inventory": {
+        "type": "inventory",
+        "action": "string (equip|drop|move)",
+        "item_id": "string",
+        "slot": "number (optional)"
+      },
+      "chat": {
+        "type": "chat",
+        "channel": "string (session|party)",
+        "text": "string"
+      },
+      "ping": { "type": "ping", "t": "number (client clock)" }
+    },
+    "out": {
+      "joined": {
+        "type": "joined",
+        "session_id": "string",
+        "your_entity_id": "string",
+        "snapshot": "C3 snapshot (full world state at join)"
+      },
+      "state": {
+        "type": "state",
+        "tick": "number",
+        "players": "array of {entity_id, position, look, vel, health}"
+      },
+      "spawn": {
+        "type": "spawn",
+        "entity_id": "string",
+        "entity_type": "string",
+        "position": "vec3",
+        "owner": "string (optional)"
+      },
+      "despawn": { "type": "despawn", "entity_id": "string" },
+      "object": {
+        "type": "object",
+        "op": "C3 delta op (place|remove|mutate)",
+        "entity_id": "string"
+      },
+      "inventory": {
+        "type": "inventory",
+        "entity_id": "string",
+        "items": "array of {item_id, slot, qty}"
+      },
+      "chat": {
+        "type": "chat",
+        "from_entity_id": "string",
+        "channel": "string",
+        "text": "string",
+        "t": "number"
+      },
+      "error": {
+        "type": "error",
+        "code": "string (auth|invalid|rate_limit|not_found|forbidden)",
+        "message": "string",
+        "ref_seq": "number (optional; which input failed)"
+      },
+      "pong": { "type": "pong", "t": "number (echo)", "server_t": "number" }
+    }
+  },
+  "owns_in_C4": [
+    "wss://.../play",
+    "POST /sessions {world_id}",
+    "POST /sessions/:id/invite"
+  ],
+  "c3_delta_emission": {
+    "$comment": "Every validated mutation emits a C3 save-delta op to CW5. Shape RECONCILE against C3 save-delta.schema.json when Day0 lands.",
+    "op_envelope": {
+      "op": "string (place|remove|mutate|inventory)",
+      "session_id": "string",
+      "world_id": "string",
+      "actor_entity_id": "string",
+      "tick": "number",
+      "payload": "object (op-specific)",
+      "ts": "string (ISO)"
+    }
+  }
+}
