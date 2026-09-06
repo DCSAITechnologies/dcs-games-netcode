@@ -1,0 +1,43 @@
+# CW4 netcode CI — BLOCKING.
+#
+# The netcode suite was only ever run from the backend pipeline's `netcode` job,
+# and that job carries `continue-on-error: true`. A speedhack regression, a lag-
+# compensation regression or a broken reconnect handshake therefore produced a
+# green pipeline. This workflow is the netcode repo's own gate and it is allowed
+# to fail the build.
+#
+# Verified before making it blocking: the full suite was run locally on
+# 2026-09-06 (macOS 15.1, arm64, Node v25.8.2) and exited 0 —
+# 13 suites, 197 checks, 0 failures. Turning a red suite into a hard gate would
+# just break everyone's build, so this only exists because the suite is green.
+
+name: CW4 Netcode CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  netcode:
+    name: Netcode suite (anti-cheat, sync, reconnect, AOI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: TypeScript build must succeed
+        run: npm run build
+
+      # No continue-on-error. A netcode regression fails this job and the job
+      # fails the workflow — which is the entire point of the file.
+      - name: Full netcode suite
+        run: npm test
