@@ -38,9 +38,15 @@ async function run() {
   bob.join('tok:bob', 'w', session.session_id);
   await sleep(60);
 
-  // Move bob far away (out of AOI radius 5). Walk +x in legal steps to ~x=10.
+  // Move bob far away (out of AOI radius 5), at a speed the server will actually allow.
+  //
+  // This test used to step 0.5 units every 15ms -- 33 units/sec against a stated
+  // limit of 8. It passed only because the validator took its time budget from
+  // the client's claimed dt, which is the 7.5x speedhack Round-2 executed. Now
+  // that the budget is derived server-side, the test walks at a legal ~7.5
+  // units/sec: 0.45 units per 60ms step.
   let bseq = 1;
-  for (let i = 0; i < 30; i++) { bob.move({ x: 0.5, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(15); }
+  for (let i = 0; i < 30; i++) { bob.move({ x: 0.45, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(60); }
   await sleep(200);
 
   const bobPos = session.snapshot().players.find((p) => p.entity_id === bob.entity_id)!.position;
@@ -56,7 +62,7 @@ async function run() {
   // ===== Entity entering AOI appears =====
   console.log('┌─ Entity entering AOI becomes visible ─────────────────┐\n');
   // bob walks back toward origin (into AOI)
-  for (let i = 0; i < 30; i++) { bob.move({ x: -0.5, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(15); }
+  for (let i = 0; i < 30; i++) { bob.move({ x: -0.45, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(60); }
   await sleep(200);
   const bobPos2 = session.snapshot().players.find((p) => p.entity_id === bob.entity_id)!.position;
   check('bob walked back into AOI (x <= 5)', bobPos2.x <= 5);
@@ -68,7 +74,7 @@ async function run() {
   console.log('┌─ Entity leaving AOI → removed[] ──────────────────────┐\n');
   aliceRaw.length = 0;
   // bob walks far away again
-  for (let i = 0; i < 30; i++) { bob.move({ x: 0.5, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(15); }
+  for (let i = 0; i < 30; i++) { bob.move({ x: 0.45, y: 0, z: 0 }, 1 / 15, bseq++); await sleep(60); }
   await sleep(200);
   const sawBobRemoved = aliceRaw.some((f: any) => f.type === 'state_delta' && f.removed.includes(bob.entity_id));
   check('alice received bob in removed[] when he left AOI', sawBobRemoved);
@@ -94,7 +100,7 @@ async function run() {
   await sleep(50);
   // move c2 far — with AOI off, c1 still sees it
   let cseq = 1;
-  for (let i = 0; i < 20; i++) { c2.move({ x: 0.5, y: 0, z: 0 }, 1 / 15, cseq++); await sleep(15); }
+  for (let i = 0; i < 20; i++) { c2.move({ x: 0.45, y: 0, z: 0 }, 1 / 15, cseq++); await sleep(60); }
   await sleep(150);
   check('AOI off: c1 sees distant c2 (no culling)', c1.observedPlayers.has(c2.entity_id!));
 

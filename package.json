@@ -1,7 +1,7 @@
 {
   "name": "dcs-games-cw4-netcode",
   "version": "1.0.0",
-  "description": "DCS Games CW4 — authoritative session server, sync, validation, presence, party, reconnect, delta compression, lag-comp, AOI. 173 checks / 11 suites green.",
+  "description": "DCS Games CW4 \u2014 authoritative session server, sync, validation, presence, party, reconnect, delta compression, lag-comp, AOI. 173 checks / 11 suites green.",
   "type": "module",
   "private": true,
   "main": "dist/server.js",
@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "server": "node dist/server.js",
     "server:dev": "tsx src/server.ts",
-    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke",
+    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke && npm run test:speedhack",
     "test:mp0": "tsx tests/mp0-acceptance.test.ts",
     "test:mp1": "tsx tests/mp1-acceptance.test.ts",
     "test:mp2": "tsx tests/mp2-conformance.test.ts",
@@ -22,7 +22,8 @@
     "test:aoi": "tsx tests/aoi.test.ts",
     "test:persistence": "tsx tests/persistence-client.test.ts",
     "test:movement": "tsx tests/movement-regression.test.ts",
-    "test:smoke": "node tests/mock-server-smoke.mjs"
+    "test:smoke": "node tests/mock-server-smoke.mjs",
+    "test:speedhack": "tsx tests/speedhack-regression.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
@@ -35,7 +36,11 @@
   "cw4_manifest": {
     "lane": "CW4 Netcode",
     "project": "DCS Games",
-    "owns_C4_routes": ["wss://.../play", "POST /sessions", "POST /sessions/:id/invite"],
+    "owns_C4_routes": [
+      "wss://.../play",
+      "POST /sessions",
+      "POST /sessions/:id/invite"
+    ],
     "implements_contract": "C2 (contracts/netcode-protocol.json)",
     "build_command": "npm install && npm run build",
     "run_command": "npm start",
