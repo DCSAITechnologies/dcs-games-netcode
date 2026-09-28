@@ -400,7 +400,9 @@ export class Session {
     }
     // Ownership: a world-owned object (owner null) is free to interact with; an
     // object someone else owns is not.
-    const owner = (target as any).owner_entity_id ?? (target as any).owner_id ?? null;
+    // games-c B1: WorldObject stores the owner as `owner` (set at place time);
+    // the old owner_entity_id/owner_id reads never matched, so the check never fired.
+    const owner = target.owner ?? null;
     if (owner && owner !== entity_id) {
       conn.send({ type: 'error', code: 'forbidden', message: 'that object belongs to another player' });
       return;
