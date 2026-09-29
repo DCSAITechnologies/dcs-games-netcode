@@ -52,6 +52,8 @@ function serializePlayer(p: PlayerState): string {
  */
 export interface ClientConn {
   entity_id: string;
+  /** Verified user id (token `sub`) behind this entity, when known. Stamped on C3 deltas. */
+  user_id?: string;
   send(frame: OutboundFrame): void;
 }
 
@@ -611,7 +613,9 @@ export class Session {
 
   private emitC3(delta: C3Delta) {
     try {
-      this.c3Sink(delta);
+      // Persistence needs the backend identity, not just the netcode entity id.
+      const uid = this.conns.get(delta.actor_entity_id)?.user_id;
+      this.c3Sink(uid && !delta.actor_user_id ? { ...delta, actor_user_id: uid } : delta);
     } catch (err) {
       // C3 emission failure must not crash the session; log + continue
       console.error(`[C3] emit failed: ${err instanceof Error ? err.message : String(err)}`);

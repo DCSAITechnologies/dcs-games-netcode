@@ -53,6 +53,8 @@ function bootServer(port: number): Promise<ChildProcess> {
     delete env.NETCODE_ALLOW_MOCK_AUTH;
     delete env.CW5_PERSISTENCE_URL;
     delete env.CW5_PERSISTENCE_TOKEN;
+    delete env.NETCODE_PERSISTENCE_URL;
+    delete env.NETCODE_PERSISTENCE_TOKEN;
     const tsx = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
     const child = spawn(tsx, ['src/server.ts'], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
@@ -143,7 +145,7 @@ async function run(): Promise<boolean> {
     const h = await httpJson(`${base}/health`);
     check('GET /health → ok:true', h.status === 200 && h.body?.ok === true);
     check('health reports auth mode hs256', h.body?.auth === 'hs256');
-    check('health reports local persistence (offline)', h.body?.persistence?.mode === 'local');
+    check('health reports no-op persistence (offline, no URL)', h.body?.persistence?.mode === 'noop');
     const bad = await httpJson(`${base}/sessions`, { method: 'POST', body: '{}' });
     check('POST /sessions without world_id → 400', bad.status === 400);
     const cs = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: WORLD }) });

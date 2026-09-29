@@ -172,7 +172,8 @@ const PORT = process.env.PORT
     ? Number(process.env.CW4_MOCK_PORT)
     : 8090;
 
-// C5 delta sink → live CW5 persistence when CW5_PERSISTENCE_URL is set, else local.
+// Delta sink → backend persistence when NETCODE_PERSISTENCE_URL (alias CW5_PERSISTENCE_URL)
+// is set; otherwise a no-op with a logged warning. emit() never blocks the tick.
 const persistence = deltaSinkFromEnv();
 const c3Sink = (d: C3Delta) => persistence.emit(d);
 
@@ -252,7 +253,7 @@ const server = http.createServer((req, res) => {
       max_sessions: sessionManager.maxSessions,
       sessions_gc_closed: sessionManager.gcClosed,
       auth: auth.mode,
-      persistence: { mode: process.env.CW5_PERSISTENCE_URL ? 'live' : 'local', deltas_emitted: persistence.count },
+      persistence: { mode: persistence.mode, deltas_emitted: persistence.count, deltas_dropped: persistence.dropped },
     }));
     return;
   }

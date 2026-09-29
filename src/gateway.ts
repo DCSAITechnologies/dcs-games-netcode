@@ -164,6 +164,7 @@ export class Gateway {
     // 4. Wire transport into a ClientConn
     const conn: ClientConn = {
       entity_id,
+      user_id: auth.user_id,
       send: (f) => transport.send(f),
     };
 

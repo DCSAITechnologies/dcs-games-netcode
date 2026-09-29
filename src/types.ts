@@ -245,6 +245,8 @@ export interface C3Delta {
   session_id: string;
   world_id: string;
   actor_entity_id: string;
+  /** Verified user id (token `sub`) of the actor — what the backend keys ownership on. */
+  actor_user_id?: string;
   tick: number;
   payload: Record<string, unknown>;
   ts: string; // ISO
