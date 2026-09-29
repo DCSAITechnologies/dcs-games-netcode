@@ -334,7 +334,7 @@ server.requestTimeout = 15_000;
 server.listen(PORT, () => {
   console.log(`[CW4 mock] WS gateway up on ws://localhost:${PORT}/play`);
   console.log(`[CW4 mock] HTTP: POST /sessions, POST /sessions/:id/invite, GET /health`);
-  console.log(`[CW4 mock] CW8/CW3 dial ws://localhost:${PORT}/play and send {type:'join',token:'tok:<id>',world_id}.`);
+  console.log(`[CW4 mock] CW8/CW3 dial ws://localhost:${PORT}/play and send {type:'join',token:'<HS256 JWT>',world_id}. auth=${auth.mode}`);
 });
 
 process.on('SIGINT', () => {
