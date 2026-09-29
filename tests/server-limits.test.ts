@@ -39,7 +39,7 @@ function freePort(): Promise<number> {
 const children: ChildProcess[] = [];
 async function boot(extraEnv: Record<string, string>): Promise<{ port: number; out: () => string }> {
   const port = await freePort();
-  const env: Record<string, string | undefined> = { ...process.env, PORT: String(port), ...extraEnv };
+  const env: Record<string, string | undefined> = { ...process.env, PORT: String(port), NETCODE_MULTIPLAYER_ENABLED: '1', NETCODE_MAX_SESSIONS_PER_USER: '100', ...extraEnv };
   for (const k of ['CW5_PERSISTENCE_URL', 'CW5_PERSISTENCE_TOKEN', 'NETCODE_PERSISTENCE_URL', 'NETCODE_PERSISTENCE_TOKEN']) delete env[k];
   if (!('NETCODE_JWT_SECRET' in extraEnv)) delete env.NETCODE_JWT_SECRET;
   if (!('NETCODE_ALLOW_MOCK_AUTH' in extraEnv)) delete env.NETCODE_ALLOW_MOCK_AUTH;
@@ -57,8 +57,9 @@ async function boot(extraEnv: Record<string, string>): Promise<{ port: number; o
   return { port, out: () => out };
 }
 
+// /sessions routes are authenticated (Bearer JWT); every call here is made as one owner.
 async function httpJson(url: string, init?: RequestInit): Promise<{ status: number; body: any }> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, { ...init, headers: { authorization: `Bearer ${tok('http-owner')}`, ...(init?.headers as Record<string, string> | undefined) } });
   let body: any = null;
   try { body = await res.json(); } catch { /* */ }
   return { status: res.status, body };
@@ -164,7 +165,7 @@ async function run(): Promise<boolean> {
   const big = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: WORLD, pad: 'p'.repeat(4000) }) });
   check('declared body over 1 KiB → 413', big.status === 413 && big.body?.max_bytes === 1024);
   const streamed = await new Promise<{ status: number; closed: boolean }>((resolve) => {
-    const req = http.request({ host: '127.0.0.1', port: A.port, method: 'POST', path: '/sessions', headers: { 'transfer-encoding': 'chunked' } }, (res) => {
+    const req = http.request({ host: '127.0.0.1', port: A.port, method: 'POST', path: '/sessions', headers: { 'transfer-encoding': 'chunked', authorization: `Bearer ${tok('http-owner')}` } }, (res) => {
       res.resume();
       res.on('end', () => resolve({ status: res.statusCode || 0, closed: res.headers.connection === 'close' }));
     });

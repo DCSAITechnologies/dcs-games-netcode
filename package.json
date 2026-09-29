@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "server": "node dist/server.js",
     "server:dev": "tsx src/server.ts",
-    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke && npm run test:speedhack && npm run test:gamesc-slice && npm run test:auth && npm run test:hardening && npm run test:limits",
+    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke && npm run test:speedhack && npm run test:gamesc-slice && npm run test:auth && npm run test:hardening && npm run test:limits && npm run test:backend-delta && npm run test:closure && npm run test:flag-off",
     "test:mp0": "tsx tests/mp0-acceptance.test.ts",
     "test:mp1": "tsx tests/mp1-acceptance.test.ts",
     "test:mp2": "tsx tests/mp2-conformance.test.ts",
@@ -27,7 +27,10 @@
     "test:gamesc-slice": "tsx tests/games-c-vertical-slice.test.ts",
     "test:auth": "tsx tests/auth-jwt.test.ts",
     "test:hardening": "tsx tests/session-hardening.test.ts",
-    "test:limits": "tsx tests/server-limits.test.ts"
+    "test:limits": "tsx tests/server-limits.test.ts",
+    "test:backend-delta": "node --test tests/persistence-delta-backend.test.mjs",
+    "test:closure": "tsx tests/closure-e2e.test.ts",
+    "test:flag-off": "tsx tests/feature-flag-off.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

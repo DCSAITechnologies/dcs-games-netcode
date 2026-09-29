@@ -41,3 +41,7 @@ jobs:
       # fails the workflow — which is the entire point of the file.
       - name: Full netcode suite
         run: npm test
+        env:
+          # No frontend checkout in this repo's CI: the flag-OFF frontend scan
+          # prints SKIPPED here and must be run locally with DCS_SITE_DIR set.
+          DCS_SITE_SCAN: skip

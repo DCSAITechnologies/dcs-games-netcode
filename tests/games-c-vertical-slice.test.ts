@@ -49,7 +49,7 @@ function freePort(): Promise<number> {
 
 function bootServer(port: number): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
-    const env: Record<string, string | undefined> = { ...process.env, PORT: String(port), NETCODE_JWT_SECRET: JWT_SECRET };
+    const env: Record<string, string | undefined> = { ...process.env, PORT: String(port), NETCODE_JWT_SECRET: JWT_SECRET, NETCODE_MULTIPLAYER_ENABLED: '1', NETCODE_MAX_SESSIONS_PER_USER: '100' };
     delete env.NETCODE_ALLOW_MOCK_AUTH;
     delete env.CW5_PERSISTENCE_URL;
     delete env.CW5_PERSISTENCE_TOKEN;
@@ -104,8 +104,9 @@ class Client {
   close() { try { this.ws.close(); } catch { /* */ } }
 }
 
+// /sessions routes are authenticated (Bearer JWT); every call here is made as one owner.
 async function httpJson(url: string, init?: RequestInit): Promise<{ status: number; body: any }> {
-  const res = await fetch(url, init);
+  const res = await fetch(url, { ...init, headers: { authorization: `Bearer ${tok('http-owner')}`, ...(init?.headers as Record<string, string> | undefined) } });
   let body: any = null;
   try { body = await res.json(); } catch { /* */ }
   return { status: res.status, body };
