@@ -36,6 +36,9 @@ export const LIMITS = {
  */
 export const WORLD_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 
+/** Placeable object type — identical to the backend delta ingest's check. */
+export const OBJECT_TYPE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+
 export function isValidWorldId(world_id: unknown): world_id is string {
   return typeof world_id === 'string' && WORLD_ID_RE.test(world_id);
 }
@@ -222,6 +225,15 @@ export function validatePlacement(
   }
   if (typeof place.object_type !== 'string' || place.object_type.length === 0) {
     return { valid: false, code: 'invalid', reason: 'missing object_type' };
+  }
+  // Same shape the backend's delta ingest accepts, so a placement the server
+  // applies is never one persistence then refuses.
+  if (!OBJECT_TYPE_RE.test(place.object_type)) {
+    return { valid: false, code: 'invalid', reason: 'bad object_type' };
+  }
+  const r = place.rotation;
+  if (!r || typeof r !== 'object' || typeof r.yaw !== 'number' || !isFinite(r.yaw)) {
+    return { valid: false, code: 'invalid', reason: 'bad rotation' };
   }
   return { valid: true };
 }

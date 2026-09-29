@@ -138,3 +138,83 @@ export class MockOwnershipStore implements OwnershipStore {
     return !items.some((i) => i.slot === slot);
   }
 }
+
+/**
+ * An ownership store the netcode server holds authoritatively for the life of
+ * a session: validated intents are APPLIED to it, pickups grant into it, and
+ * persistence replay seeds it. The backend's delta log stays the durable copy.
+ */
+export interface MutableOwnershipStore extends OwnershipStore {
+  /** Apply an intent that handleInventoryIntent has already validated. */
+  apply(entity_id: string, intent: InventoryIntent): void;
+  /** Grant an item into the first free slot; null when the inventory is full or already holds it. */
+  grantNext(entity_id: string, item_id: string): InventoryItem | null;
+  /** Replace an entity's inventory (persistence replay / rejoin). Bounded to MAX_SLOTS. */
+  seed(entity_id: string, items: InventoryItem[]): void;
+  /** Drop everything held for an entity (entity purged / session closed). */
+  forget(entity_id: string): void;
+}
+
+export function isMutableOwnershipStore(s: OwnershipStore | undefined): s is MutableOwnershipStore {
+  return !!s && typeof (s as MutableOwnershipStore).apply === 'function' && typeof (s as MutableOwnershipStore).seed === 'function';
+}
+
+export const INVENTORY_MAX_SLOTS = MAX_SLOTS;
+
+/** The real server's store: in memory, per process, bounded to MAX_SLOTS items per entity. */
+export class LiveOwnershipStore implements MutableOwnershipStore {
+  private inv: Map<string, Map<string, InventoryItem>> = new Map();
+
+  owns(entity_id: string, item_id: string): boolean {
+    return this.inv.get(entity_id)?.has(item_id) ?? false;
+  }
+
+  getInventory(entity_id: string): InventoryItem[] {
+    return Array.from(this.inv.get(entity_id)?.values() ?? [], (i) => ({ ...i }));
+  }
+
+  slotFree(entity_id: string, slot: number): boolean {
+    return !this.getInventory(entity_id).some((i) => i.slot === slot);
+  }
+
+  apply(entity_id: string, intent: InventoryIntent): void {
+    const items = this.inv.get(entity_id);
+    const item = items?.get(intent.item_id);
+    if (!items || !item) return;
+    if (intent.action === 'drop') items.delete(intent.item_id);
+    else if (typeof intent.slot === 'number') item.slot = intent.slot;
+  }
+
+  grantNext(entity_id: string, item_id: string): InventoryItem | null {
+    let items = this.inv.get(entity_id);
+    if (items?.has(item_id)) return null;
+    const used = new Set(Array.from(items?.values() ?? [], (i) => i.slot));
+    let slot = -1;
+    for (let s = 0; s < MAX_SLOTS; s++) if (!used.has(s)) { slot = s; break; }
+    if (slot < 0) return null;
+    if (!items) { items = new Map(); this.inv.set(entity_id, items); }
+    const item = { item_id, slot, qty: 1 };
+    items.set(item_id, item);
+    return { ...item };
+  }
+
+  seed(entity_id: string, list: InventoryItem[]): void {
+    const items = new Map<string, InventoryItem>();
+    const used = new Set<number>();
+    for (const i of list) {
+      if (items.size >= MAX_SLOTS) break;
+      if (typeof i.item_id !== 'string' || !Number.isInteger(i.slot) || i.slot < 0 || i.slot >= MAX_SLOTS || used.has(i.slot)) continue;
+      used.add(i.slot);
+      items.set(i.item_id, { item_id: i.item_id, slot: i.slot, qty: Number.isInteger(i.qty) && i.qty > 0 ? i.qty : 1 });
+    }
+    this.inv.set(entity_id, items);
+  }
+
+  forget(entity_id: string): void {
+    this.inv.delete(entity_id);
+  }
+
+  get entityCount(): number {
+    return this.inv.size;
+  }
+}

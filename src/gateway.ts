@@ -3,7 +3,6 @@
 // Validates CW1 token on join, routes frames to the right session.
 // Transport-agnostic: a real WS server or the headless bot harness both drive this.
 
-import crypto from 'node:crypto';
 import {
   JoinFrame,
   InboundFrame,
@@ -13,8 +12,28 @@ import {
   PartyLaunchFrame,
   PartyLeaveFrame,
 } from './types.js';
-import { Session, SessionManager, ClientConn, SessionCapError } from './session.js';
-import { isValidWorldId, samePosition } from './validation.js';
+import { Session, SessionManager, ClientConn, SessionCapError, SessionQuotaError, entityIdFor } from './session.js';
+import { isValidWorldId, samePosition, WORLD_ID_RE } from './validation.js';
+import { PartyError } from './party.js';
+
+/** Result of reading the tenant claim: undefined claim → null tenant; a malformed one is refused. */
+export function tenantOf(claims: Record<string, unknown> | undefined): { ok: true; tenant: string | null } | { ok: false } {
+  const t = claims?.tenant_id;
+  if (t === undefined || t === null) return { ok: true, tenant: null };
+  if (typeof t === 'string' && WORLD_ID_RE.test(t)) return { ok: true, tenant: t };
+  return { ok: false };
+}
+
+export interface GatewayOptions {
+  presence?: import('./presence.js').PresenceService;
+  party?: import('./party.js').PartyManager;
+  /**
+   * Require every join / party_create token to carry a `world_id` claim — i.e.
+   * a backend-minted ticket, issued only after the backend checked the user may
+   * play that world. Plain access tokens are then refused.
+   */
+  requireWorldTicket?: boolean;
+}
 
 /**
  * Token verifier seam (synchronous — a join must not wait on the network).
@@ -47,19 +66,19 @@ export class Gateway {
   // Optional M-P1 services (backward-compatible: may be undefined for P0 tests)
   private presence?: import('./presence.js').PresenceService;
   private party?: import('./party.js').PartyManager;
+  private requireWorldTicket: boolean;
 
-  constructor(
-    sessionManager: SessionManager,
-    verifyToken: TokenVerifier,
-    opts?: {
-      presence?: import('./presence.js').PresenceService;
-      party?: import('./party.js').PartyManager;
-    }
-  ) {
+  constructor(sessionManager: SessionManager, verifyToken: TokenVerifier, opts?: GatewayOptions) {
     this.sessionManager = sessionManager;
     this.verifyToken = verifyToken;
     this.presence = opts?.presence;
     this.party = opts?.party;
+    this.requireWorldTicket = opts?.requireWorldTicket === true;
+  }
+
+  /** Connected transports (diagnostics / leak checks). */
+  get boundCount(): number {
+    return this.bound.size;
   }
 
   /**
@@ -107,6 +126,17 @@ export class Gateway {
       transport.close();
       return;
     }
+    if (this.requireWorldTicket && typeof auth.claims?.world_id !== 'string') {
+      transport.send({ type: 'error', code: 'auth', message: 'a world ticket is required to join' });
+      transport.close();
+      return;
+    }
+    const tenant = tenantOf(auth.claims);
+    if (!tenant.ok) {
+      transport.send({ type: 'error', code: 'auth', message: 'bad tenant claim' });
+      transport.close();
+      return;
+    }
     // 1b. A token minted for one world/session (a backend "ticket") cannot be
     //     replayed into another. Plain Supabase access tokens carry neither claim.
     const claimWorld = auth.claims?.world_id;
@@ -122,7 +152,13 @@ export class Gateway {
     //    M-P1: if the user is in a launched party, route them to the party's session
     //    (group spawn) — overrides any session_id the client sent.
     let session: Session | null;
-    const partySessionId = this.party?.resolveSessionForMember(auth.user_id!);
+    let partySessionId = this.party?.resolveSessionForMember(auth.user_id!) || null;
+    // A launched party whose session has since closed must not strand its
+    // members: every later join would be routed to a dead session id.
+    if (partySessionId && !this.sessionManager.getSession(partySessionId)) {
+      this.party!.forgetSession(partySessionId);
+      partySessionId = null;
+    }
     const targetSessionId = partySessionId || frame.session_id;
 
     if (targetSessionId) {
@@ -136,12 +172,21 @@ export class Gateway {
         transport.send({ type: 'error', code: 'world_mismatch', message: 'session belongs to a different world_id' });
         return;
       }
+      // Tenant isolation: a session only admits users of the tenant that created it.
+      if ((session.tenant_id || null) !== tenant.tenant) {
+        transport.send({ type: 'error', code: 'forbidden', message: 'session belongs to another tenant' });
+        return;
+      }
     } else {
       try {
-        session = this.sessionManager.createSession(frame.world_id);
+        session = this.sessionManager.createSession(frame.world_id, { ownerUserId: auth.user_id, tenantId: tenant.tenant });
       } catch (err) {
         if (err instanceof SessionCapError) {
           transport.send({ type: 'error', code: 'capacity', message: 'server is at its session cap; try again later' });
+          return;
+        }
+        if (err instanceof SessionQuotaError) {
+          transport.send({ type: 'error', code: 'capacity', message: err.message });
           return;
         }
         throw err;
@@ -149,11 +194,7 @@ export class Gateway {
     }
 
     // 3. Allocate stable entity id (deterministic from user_id + session)
-    const entity_id = `e_${crypto
-      .createHash('sha256')
-      .update(`${auth.user_id}:${session.session_id}`)
-      .digest('hex')
-      .slice(0, 12)}`;
+    const entity_id = entityIdFor(auth.user_id!, session.session_id);
 
     // 3b. Seat check (max players). Reconnects inside the grace window keep their seat.
     if (!session.canAdmit(entity_id)) {
@@ -197,6 +238,8 @@ export class Gateway {
       spawn,
       snapshot,
     });
+    // 7. Restored inventory (persistence replay / resume) follows the snapshot.
+    session.pushInventory(entity_id);
   }
 
   /**
@@ -217,6 +260,11 @@ export class Gateway {
       return;
     }
     const user_id = auth.user_id!;
+    const tenant = tenantOf(auth.claims);
+    if (!tenant.ok) {
+      transport.send({ type: 'error', code: 'auth', message: 'bad tenant claim' });
+      return;
+    }
 
     switch (frame.type) {
       case 'party_create': {
@@ -224,12 +272,26 @@ export class Gateway {
           transport.send({ type: 'error', code: 'invalid', message: 'bad world_id' });
           return;
         }
-        const party = this.party.createParty(user_id, frame.world_id);
-        this.pushPartyState(transport, party.party_id);
+        const claimWorld = auth.claims?.world_id;
+        if ((this.requireWorldTicket && typeof claimWorld !== 'string') || (typeof claimWorld === 'string' && claimWorld !== frame.world_id)) {
+          transport.send({ type: 'error', code: 'auth', message: 'token is not valid for this world' });
+          return;
+        }
+        let created;
+        try {
+          created = this.party.createParty(user_id, frame.world_id, tenant.tenant);
+        } catch (err) {
+          if (err instanceof PartyError) {
+            transport.send({ type: 'error', code: 'invalid', message: err.message });
+            return;
+          }
+          throw err;
+        }
+        this.pushPartyState(transport, created.party_id);
         break;
       }
       case 'party_join': {
-        const res = this.party.joinParty(frame.invite_code, user_id);
+        const res = this.party.joinParty(frame.invite_code, user_id, tenant.tenant);
         if (!res.ok) {
           transport.send({ type: 'error', code: 'invalid', message: res.error || 'join failed' });
           return;
@@ -250,16 +312,21 @@ export class Gateway {
         }
         let session: Session;
         try {
-          session = this.sessionManager.createSession(party.world_id);
+          session = this.sessionManager.createSession(party.world_id, { ownerUserId: user_id, tenantId: party.tenant_id });
         } catch (err) {
           if (err instanceof SessionCapError) {
             transport.send({ type: 'error', code: 'capacity', message: 'server is at its session cap; try again later' });
+            return;
+          }
+          if (err instanceof SessionQuotaError) {
+            transport.send({ type: 'error', code: 'capacity', message: err.message });
             return;
           }
           throw err;
         }
         const res = this.party.launchParty(frame.party_id, session.session_id);
         if (!res.ok) {
+          this.sessionManager.closeSession(session.session_id);
           transport.send({ type: 'error', code: 'invalid', message: res.error || 'launch failed' });
           return;
         }
@@ -267,6 +334,11 @@ export class Gateway {
         break;
       }
       case 'party_leave': {
+        // Only a member can leave (and learn the party's state).
+        if (!this.party.getParty(frame.party_id)?.member_user_ids.includes(user_id)) {
+          transport.send({ type: 'error', code: 'not_found', message: 'party not found' });
+          return;
+        }
         this.party.leaveParty(frame.party_id, user_id);
         // Party may be disbanded (leader left) — push state if it still exists.
         const party = this.party.getParty(frame.party_id);

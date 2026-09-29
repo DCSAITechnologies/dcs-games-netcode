@@ -29,8 +29,11 @@ import {
 } from './validation.js';
 import {
   OwnershipStore,
+  InventoryItem,
   handleInventoryIntent,
+  isMutableOwnershipStore,
 } from './inventory.js';
+import type { ReplayState } from './replay.js';
 
 export const TICK_HZ = 15;
 export const TICK_MS = 1000 / TICK_HZ;
@@ -73,6 +76,19 @@ export interface SessionOptions {
   spawnPoints?: SpawnPoint[];
   /** Seed for spawn selection. Default: the session id. */
   spawnSeed?: string;
+  /** Verified user id that created the session (POST /sessions, implicit join, party launch). */
+  ownerUserId?: string;
+  /** Tenant the session belongs to (the creator's verified `tenant_id` claim). Joins from another tenant are refused. */
+  tenantId?: string | null;
+}
+
+/**
+ * The entity id a user has in a session: stable for (user, session), so a
+ * reconnect lands on the same entity and replayed objects can be re-owned by
+ * the user's entity in a NEW session.
+ */
+export function entityIdFor(user_id: string, session_id: string): string {
+  return `e_${crypto.createHash('sha256').update(`${user_id}:${session_id}`).digest('hex').slice(0, 12)}`;
 }
 
 /** Where a fresh player spawns when the world provides no spawn points. */
@@ -83,6 +99,9 @@ export class SessionFullError extends Error {}
 
 /** Thrown by SessionManager.createSession when the server is at its session cap. */
 export class SessionCapError extends Error {}
+
+/** Thrown by SessionManager.createSession when one user already owns maxSessionsPerUser live sessions. */
+export class SessionQuotaError extends Error {}
 
 /**
  * Authoritative game session. One per active world instance.
@@ -128,6 +147,14 @@ export class Session {
   readonly maxPlayers: number;
   private spawnPoints: SpawnPoint[];
   private spawnSeed: string;
+  readonly owner_user_id: string | null;
+  readonly tenant_id: string | null;
+  /** entity_id -> verified user id, for connected AND grace-held players. */
+  private entityUsers: Map<string, string> = new Map();
+  /** Per-user inventory restored by persistence replay; seeded into the store on first join. */
+  private replayedInventory: Map<string, InventoryItem[]> = new Map();
+  /** Has persistence replay been applied (or found nothing to apply)? */
+  hydrated = false;
 
   constructor(world_id: string, c3Sink: C3Sink, session_id?: string, ownership?: OwnershipStore, opts?: SessionOptions) {
     this.world_id = world_id;
@@ -138,6 +165,68 @@ export class Session {
     this.maxPlayers = Number.isInteger(mp) && (mp as number) >= 1 ? (mp as number) : Session.DEFAULT_MAX_PLAYERS;
     this.spawnPoints = (opts?.spawnPoints || []).map((p) => ({ id: p.id, position: { ...p.position } }));
     this.spawnSeed = opts?.spawnSeed || this.session_id;
+    this.owner_user_id = opts?.ownerUserId || null;
+    this.tenant_id = opts?.tenantId || null;
+  }
+
+  /** Is this user connected to, or held in the reconnect grace window of, this session? */
+  hasMember(user_id: string): boolean {
+    for (const u of this.entityUsers.values()) if (u === user_id) return true;
+    return false;
+  }
+
+  /**
+   * Apply persisted deltas (persistence replay) to a session's world state.
+   * place/remove rebuild the object set; inventory deltas rebuild each user's
+   * inventory, seeded into the ownership store when that user joins. Object
+   * ownership is re-keyed to the user's entity in THIS session. Replay never
+   * emits deltas (it would echo them back to the backend). Connected clients
+   * are told about every change.
+   */
+  applyReplay(state: ReplayState): void {
+    for (const id of state.removed) {
+      if (this.objects.delete(id)) this.broadcast({ type: 'object', op: 'remove', entity_id: id });
+    }
+    for (const o of state.objects) {
+      if (this.objects.has(o.entity_id)) continue;
+      const obj: WorldObject = {
+        entity_id: o.entity_id,
+        object_type: o.object_type,
+        position: { ...o.position },
+        rotation: { yaw: o.rotation.yaw },
+        owner: o.owner_user_id ? entityIdFor(o.owner_user_id, this.session_id) : '',
+        placed_tick: 0,
+      };
+      this.objects.set(obj.entity_id, obj);
+      this.broadcast({ type: 'object', op: 'place', entity_id: obj.entity_id, object_type: obj.object_type, position: obj.position, rotation: obj.rotation });
+    }
+    for (const [user_id, items] of state.inventories) {
+      this.replayedInventory.set(user_id, items.map((i) => ({ ...i })));
+      const eid = entityIdFor(user_id, this.session_id);
+      // Replay can land after the user joined (a session created by a join is
+      // hydrated asynchronously): seed now and tell them.
+      if (this.entityUsers.has(eid)) { this.seedInventory(eid, user_id); this.pushInventory(eid); }
+    }
+    this.hydrated = true;
+  }
+
+  /** Tell a (re)joined player what they hold, when the server holds an inventory for them. */
+  pushInventory(entity_id: string): void {
+    const conn = this.conns.get(entity_id);
+    if (!conn || !isMutableOwnershipStore(this.ownership)) return;
+    const items = this.ownership.getInventory(entity_id);
+    if (items.length > 0) conn.send({ type: 'inventory', entity_id, items });
+  }
+
+  private seedInventory(entity_id: string, user_id: string) {
+    const items = this.replayedInventory.get(user_id);
+    if (!items || !isMutableOwnershipStore(this.ownership)) return;
+    this.replayedInventory.delete(user_id);
+    // Merge, never overwrite: anything the entity already holds (picked up
+    // before replay landed) wins its item id and its slot.
+    const current = this.ownership.getInventory(entity_id);
+    const merged = [...current, ...items.filter((i) => !current.some((c) => c.item_id === i.item_id || c.slot === i.slot))];
+    this.ownership.seed(entity_id, merged);
   }
 
   // ===== Lifecycle =====
@@ -161,6 +250,9 @@ export class Session {
     this.lastInputAt.clear();
     this.rateLimiter.reset();
     this.inviteCodes.clear();
+    if (isMutableOwnershipStore(this.ownership)) for (const eid of this.entityUsers.keys()) this.ownership.forget(eid);
+    this.entityUsers.clear();
+    this.replayedInventory.clear();
   }
 
   /** No connected players and nobody held in the reconnect grace window. */
@@ -180,6 +272,15 @@ export class Session {
     this.lastInputAt.delete(entity_id);
     this.aoiSeen.delete(entity_id); // this player's own visibility map
     this.rateLimiter.resetPrefix(`${entity_id}:`);
+    // The user's inventory outlives their entity: stash it so a later rejoin
+    // (new entity after grace expiry) gets it back, then free the entity's slot.
+    const user = this.entityUsers.get(entity_id);
+    if (isMutableOwnershipStore(this.ownership)) {
+      const items = this.ownership.getInventory(entity_id);
+      if (user && items.length > 0) this.replayedInventory.set(user, items.map((i) => ({ ...i })));
+      this.ownership.forget(entity_id);
+    }
+    this.entityUsers.delete(entity_id);
   }
 
   get currentTick() {
@@ -231,6 +332,10 @@ export class Session {
   join(conn: ClientConn): WorldSnapshot {
     if (!this.canAdmit(conn.entity_id)) throw new SessionFullError(`session ${this.session_id} is full (${this.maxPlayers})`);
     this.lastActivityAt = Date.now();
+    if (conn.user_id) {
+      this.entityUsers.set(conn.entity_id, conn.user_id);
+      this.seedInventory(conn.entity_id, conn.user_id);
+    }
     // Reconnect/resume: if this entity is in the disconnected grace window,
     // reattach to its PRESERVED state (position/health/vel) instead of respawning.
     const held = this.disconnected.get(conn.entity_id);
@@ -433,8 +538,9 @@ export class Session {
     const obj: WorldObject = {
       entity_id: crypto.randomUUID(),
       object_type: frame.object_type,
-      position: frame.position,
-      rotation: frame.rotation,
+      // Copied field by field: a client's extra keys never reach state, peers or persistence.
+      position: { x: frame.position.x, y: frame.position.y, z: frame.position.z },
+      rotation: { yaw: frame.rotation.yaw },
       owner: entity_id,
       placed_tick: this.tick,
     };
@@ -506,6 +612,17 @@ export class Session {
     }
     // P0: 'pickup' removes the object; other actions are world-defined (stub)
     if (frame.action === 'pickup') {
+      // With a mutable ownership store the picked-up object becomes an item in
+      // the actor's inventory; a full inventory refuses the pickup up front.
+      const store = isMutableOwnershipStore(this.ownership) ? this.ownership : null;
+      let granted: InventoryItem | null = null;
+      if (store) {
+        granted = store.grantNext(entity_id, target.entity_id);
+        if (!granted) {
+          conn.send({ type: 'error', code: 'invalid', message: 'inventory full' });
+          return;
+        }
+      }
       this.objects.delete(target.entity_id);
       this.broadcast({ type: 'object', op: 'remove', entity_id: target.entity_id });
       this.emitC3({
@@ -517,6 +634,18 @@ export class Session {
         payload: { entity_id: target.entity_id },
         ts: new Date().toISOString(),
       });
+      if (store && granted) {
+        conn.send({ type: 'inventory', entity_id, items: store.getInventory(entity_id) });
+        this.emitC3({
+          op: 'inventory',
+          session_id: this.session_id,
+          world_id: this.world_id,
+          actor_entity_id: entity_id,
+          tick: this.tick,
+          payload: { action: 'grant', item_id: granted.item_id, slot: granted.slot, object_type: target.object_type },
+          ts: new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -538,6 +667,12 @@ export class Session {
       conn.send({ type: 'error', code: result.code || 'invalid', message: result.reason || 'invalid inventory action' });
       return;
     }
+    // A mutable (server-authoritative) store applies the validated intent, so
+    // the snapshot sent back is the post-intent inventory.
+    if (isMutableOwnershipStore(this.ownership)) {
+      this.ownership.apply(entity_id, { action: frame.action, item_id: frame.item_id, slot: frame.slot });
+      result.items = this.ownership.getInventory(entity_id);
+    }
     // Broadcast the resulting inventory snapshot to the actor (out frame: inventory)
     conn.send({ type: 'inventory', entity_id, items: result.items || [] });
     // Persist via CW5 (C3 delta)
@@ -547,6 +682,10 @@ export class Session {
   private handleChat(entity_id: string, conn: ClientConn, frame: ChatFrame) {
     if (!this.rateLimiter.allow(`${entity_id}:chat`, LIMITS.CHAT_RATE_PER_SEC)) {
       conn.send({ type: 'error', code: 'rate_limit', message: 'chat rate exceeded' });
+      return;
+    }
+    if (frame.channel !== 'session' && frame.channel !== 'party') {
+      conn.send({ type: 'error', code: 'invalid', message: 'bad chat channel' });
       return;
     }
     if (typeof frame.text !== 'string' || frame.text.length === 0 || frame.text.length > 500) {
@@ -675,6 +814,12 @@ export interface SessionManagerOptions {
   maxSessions?: number;
   /** An empty session (no players, no reconnect holds) idle this long is closed (default 60s). */
   idleTtlMs?: number;
+  /** Live sessions one user may own at once (default 5). Sessions with no owner are not counted. */
+  maxSessionsPerUser?: number;
+  /** Persistence replay: called once per new session; createSession never waits on it. */
+  hydrate?: (session: Session) => Promise<void>;
+  /** Called after a session is closed (GC, explicit close, shutdown). */
+  onClose?: (session_id: string) => void;
 }
 
 /**
@@ -690,12 +835,17 @@ export class SessionManager {
   readonly maxPlayersPerSession: number;
   readonly maxSessions: number;
   readonly idleTtlMs: number;
+  readonly maxSessionsPerUser: number;
+  private hydrate?: (session: Session) => Promise<void>;
+  private onClose?: (session_id: string) => void;
+  private hydrating: Map<string, Promise<void>> = new Map();
   private gcTimer: ReturnType<typeof setInterval> | null = null;
   /** Sessions closed by GC since boot (diagnostics / /health). */
   gcClosed = 0;
 
   static DEFAULT_MAX_SESSIONS = 500;
   static DEFAULT_IDLE_TTL_MS = 60_000;
+  static DEFAULT_MAX_SESSIONS_PER_USER = 5;
 
   constructor(c3Sink: C3Sink, ownership?: OwnershipStore, opts?: SessionManagerOptions) {
     this.c3Sink = c3Sink;
@@ -704,6 +854,20 @@ export class SessionManager {
     this.maxPlayersPerSession = posInt(opts?.maxPlayersPerSession, Session.DEFAULT_MAX_PLAYERS);
     this.maxSessions = posInt(opts?.maxSessions, SessionManager.DEFAULT_MAX_SESSIONS);
     this.idleTtlMs = typeof opts?.idleTtlMs === 'number' && opts.idleTtlMs >= 0 ? opts.idleTtlMs : SessionManager.DEFAULT_IDLE_TTL_MS;
+    this.maxSessionsPerUser = posInt(opts?.maxSessionsPerUser, SessionManager.DEFAULT_MAX_SESSIONS_PER_USER);
+    this.hydrate = opts?.hydrate;
+    this.onClose = opts?.onClose;
+  }
+
+  /** Resolves once the session's persistence replay has been applied (or failed). */
+  whenHydrated(session_id: string): Promise<void> {
+    return this.hydrating.get(session_id) ?? Promise.resolve();
+  }
+
+  sessionsOwnedBy(user_id: string): number {
+    let n = 0;
+    for (const s of this.sessions.values()) if (s.owner_user_id === user_id) n++;
+    return n;
   }
 
   /**
@@ -746,6 +910,13 @@ export class SessionManager {
       this.sweep(); // reclaim idle sessions before refusing
       if (this.sessions.size >= this.maxSessions) throw new SessionCapError(`session cap reached (${this.maxSessions})`);
     }
+    const owner = opts?.ownerUserId;
+    if (owner && this.sessionsOwnedBy(owner) >= this.maxSessionsPerUser) {
+      this.sweep();
+      if (this.sessionsOwnedBy(owner) >= this.maxSessionsPerUser) {
+        throw new SessionQuotaError(`you already have ${this.maxSessionsPerUser} live sessions`);
+      }
+    }
     // A per-session cap may lower the server's cap, never raise it.
     const cap = this.maxPlayersPerSession;
     const requested = opts?.maxPlayers;
@@ -755,6 +926,15 @@ export class SessionManager {
     const session = new Session(world_id, this.c3Sink, undefined, this.ownership, { ...opts, maxPlayers, spawnPoints: spawns.points });
     this.sessions.set(session.session_id, session);
     session.start();
+    if (this.hydrate) {
+      const id = session.session_id;
+      const p = this.hydrate(session)
+        .catch((err) => console.error(`[replay] ${id}: ${err instanceof Error ? err.message : String(err)}`))
+        .finally(() => this.hydrating.delete(id));
+      this.hydrating.set(id, p);
+    } else {
+      session.hydrated = true;
+    }
     return session;
   }
 
@@ -767,6 +947,8 @@ export class SessionManager {
     if (session) {
       session.stop();
       this.sessions.delete(session_id);
+      this.hydrating.delete(session_id);
+      try { this.onClose?.(session_id); } catch { /* observer errors never block a close */ }
     }
   }
 
