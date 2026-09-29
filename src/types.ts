@@ -180,7 +180,10 @@ export interface ChatOutFrame {
 
 export interface ErrorFrame {
   type: 'error';
-  code: 'auth' | 'invalid' | 'rate_limit' | 'not_found' | 'forbidden';
+  // session_full: join beyond the session's max_players.
+  // world_mismatch: join names a world_id other than the session's.
+  // capacity: the server is at its session cap and cannot create another.
+  code: 'auth' | 'invalid' | 'rate_limit' | 'not_found' | 'forbidden' | 'session_full' | 'world_mismatch' | 'capacity';
   message: string;
   ref_seq?: number;
 }

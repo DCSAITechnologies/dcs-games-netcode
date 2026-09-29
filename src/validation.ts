@@ -29,6 +29,17 @@ export const LIMITS = {
   CHAT_RATE_PER_SEC: 3,
 };
 
+/**
+ * World id format — IDENTICAL to the backend's world store
+ * (dcs-games backend src/core/worldstore.mjs: /^[A-Za-z0-9._:-]{1,200}$/).
+ * A world the backend cannot address cannot have a netcode session either.
+ */
+export const WORLD_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
+
+export function isValidWorldId(world_id: unknown): world_id is string {
+  return typeof world_id === 'string' && WORLD_ID_RE.test(world_id);
+}
+
 function dist(a: Vec3, b: Vec3): number {
   const dx = a.x - b.x;
   const dy = a.y - b.y;

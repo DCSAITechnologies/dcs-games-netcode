@@ -14,6 +14,7 @@ import {
   PartyLeaveFrame,
 } from './types.js';
 import { Session, SessionManager, ClientConn } from './session.js';
+import { isValidWorldId } from './validation.js';
 
 /**
  * Token verifier seam (synchronous — a join must not wait on the network).
@@ -94,6 +95,11 @@ export class Gateway {
   }
 
   private handleJoin(transport: Transport, frame: JoinFrame): void {
+    // 0. Shape: a world_id the backend could not address is refused before auth work.
+    if (!isValidWorldId(frame.world_id)) {
+      transport.send({ type: 'error', code: 'invalid', message: 'bad world_id' });
+      return;
+    }
     // 1. Auth handshake (CW1 token)
     const auth = this.verifyToken(frame.token);
     if (!auth.valid) {
@@ -125,6 +131,11 @@ export class Gateway {
         transport.send({ type: 'error', code: 'not_found', message: 'session not found' });
         return;
       }
+      // A session is bound to exactly one world for its whole life.
+      if (session.world_id !== frame.world_id) {
+        transport.send({ type: 'error', code: 'world_mismatch', message: 'session belongs to a different world_id' });
+        return;
+      }
     } else {
       session = this.sessionManager.createSession(frame.world_id);
     }
@@ -135,6 +146,12 @@ export class Gateway {
       .update(`${auth.user_id}:${session.session_id}`)
       .digest('hex')
       .slice(0, 12)}`;
+
+    // 3b. Seat check (max players). Reconnects inside the grace window keep their seat.
+    if (!session.canAdmit(entity_id)) {
+      transport.send({ type: 'error', code: 'session_full', message: `session is full (max ${session.maxPlayers} players)` });
+      return;
+    }
 
     // 4. Wire transport into a ClientConn
     const conn: ClientConn = {
@@ -185,6 +202,10 @@ export class Gateway {
 
     switch (frame.type) {
       case 'party_create': {
+        if (!isValidWorldId(frame.world_id)) {
+          transport.send({ type: 'error', code: 'invalid', message: 'bad world_id' });
+          return;
+        }
         const party = this.party.createParty(user_id, frame.world_id);
         this.pushPartyState(transport, party.party_id);
         break;

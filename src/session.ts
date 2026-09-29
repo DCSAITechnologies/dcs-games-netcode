@@ -23,6 +23,7 @@ import {
   validatePlacement,
   RateLimiter,
   LIMITS,
+  isValidWorldId,
 } from './validation.js';
 import {
   OwnershipStore,
@@ -60,6 +61,15 @@ export interface ClientConn {
  */
 export type C3Sink = (delta: C3Delta) => void;
 
+/** Per-session options (set at creation, fixed for the session's life). */
+export interface SessionOptions {
+  /** Seats in this session. Reconnect-grace holds keep their seat. Default Session.DEFAULT_MAX_PLAYERS. */
+  maxPlayers?: number;
+}
+
+/** Thrown by Session.join when the session has no free seat. */
+export class SessionFullError extends Error {}
+
 /**
  * Authoritative game session. One per active world instance.
  */
@@ -95,11 +105,17 @@ export class Session {
   // Keyframe (full state) every N ticks to let clients resync (guards drift).
   static KEYFRAME_EVERY_TICKS = 30; // 2s at 15Hz
 
-  constructor(world_id: string, c3Sink: C3Sink, session_id?: string, ownership?: OwnershipStore) {
+  // Max players per session when not specified at creation.
+  static DEFAULT_MAX_PLAYERS = 16;
+  readonly maxPlayers: number;
+
+  constructor(world_id: string, c3Sink: C3Sink, session_id?: string, ownership?: OwnershipStore, opts?: SessionOptions) {
     this.world_id = world_id;
     this.session_id = session_id || crypto.randomUUID();
     this.c3Sink = c3Sink;
     this.ownership = ownership;
+    const mp = opts?.maxPlayers;
+    this.maxPlayers = Number.isInteger(mp) && (mp as number) >= 1 ? (mp as number) : Session.DEFAULT_MAX_PLAYERS;
   }
 
   // ===== Lifecycle =====
@@ -137,7 +153,18 @@ export class Session {
 
   // ===== Join / Leave =====
 
+  /**
+   * Can this entity take (or retake) a seat? An entity already present, or held
+   * in the reconnect grace window, always can — its seat is reserved. A new
+   * entity needs a free seat: connected + held < maxPlayers.
+   */
+  canAdmit(entity_id: string): boolean {
+    if (this.players.has(entity_id) || this.disconnected.has(entity_id)) return true;
+    return this.players.size + this.disconnected.size < this.maxPlayers;
+  }
+
   join(conn: ClientConn): WorldSnapshot {
+    if (!this.canAdmit(conn.entity_id)) throw new SessionFullError(`session ${this.session_id} is full (${this.maxPlayers})`);
     // Reconnect/resume: if this entity is in the disconnected grace window,
     // reattach to its PRESERVED state (position/health/vel) instead of respawning.
     const held = this.disconnected.get(conn.entity_id);
@@ -569,6 +596,11 @@ export class Session {
   }
 }
 
+export interface SessionManagerOptions {
+  /** Server-wide max players per session (default Session.DEFAULT_MAX_PLAYERS = 16). */
+  maxPlayersPerSession?: number;
+}
+
 /**
  * Session manager: create/join/leave, invite codes.
  * Owns C4 routes: POST /sessions, POST /sessions/:id/invite
@@ -578,13 +610,23 @@ export class SessionManager {
   private c3Sink: C3Sink;
   private ownership?: OwnershipStore;
 
-  constructor(c3Sink: C3Sink, ownership?: OwnershipStore) {
+  /** Server-wide ceiling on seats per session. */
+  readonly maxPlayersPerSession: number;
+
+  constructor(c3Sink: C3Sink, ownership?: OwnershipStore, opts?: SessionManagerOptions) {
     this.c3Sink = c3Sink;
     this.ownership = ownership;
+    const mp = opts?.maxPlayersPerSession;
+    this.maxPlayersPerSession = Number.isInteger(mp) && (mp as number) >= 1 ? (mp as number) : Session.DEFAULT_MAX_PLAYERS;
   }
 
-  createSession(world_id: string): Session {
-    const session = new Session(world_id, this.c3Sink, undefined, this.ownership);
+  createSession(world_id: string, opts?: SessionOptions): Session {
+    if (!isValidWorldId(world_id)) throw new Error(`invalid world_id: ${String(world_id).slice(0, 64)}`);
+    // A per-session cap may lower the server's cap, never raise it.
+    const cap = this.maxPlayersPerSession;
+    const requested = opts?.maxPlayers;
+    const maxPlayers = Number.isInteger(requested) && (requested as number) >= 1 ? Math.min(requested as number, cap) : cap;
+    const session = new Session(world_id, this.c3Sink, undefined, this.ownership, { ...opts, maxPlayers });
     this.sessions.set(session.session_id, session);
     session.start();
     return session;
@@ -604,5 +646,9 @@ export class SessionManager {
 
   get activeSessionCount() {
     return this.sessions.size;
+  }
+
+  sessionIds(): string[] {
+    return Array.from(this.sessions.keys());
   }
 }

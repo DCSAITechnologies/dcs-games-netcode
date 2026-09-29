@@ -15,6 +15,8 @@ import { Gateway, mockTokenVerifier, Transport } from './gateway.js';
 import type { OutboundFrame, InboundFrame, C3Delta } from './types.js';
 import { deltaSinkFromEnv } from './persistence-client.js';
 import { verifierFromEnv } from './auth.js';
+import { isValidWorldId } from './validation.js';
+import { limitsFromEnv } from './config.js';
 
 // ---- Minimal RFC6455 WebSocket (server side, text frames) ----
 
@@ -97,7 +99,8 @@ const PORT = process.env.PORT
 const persistence = deltaSinkFromEnv();
 const c3Sink = (d: C3Delta) => persistence.emit(d);
 
-const sessionManager = new SessionManager(c3Sink);
+const limits = limitsFromEnv(process.env);
+const sessionManager = new SessionManager(c3Sink, undefined, { maxPlayersPerSession: limits.maxPlayersPerSession });
 // Auth: HS256 JWT (NETCODE_JWT_SECRET) or fail closed. The mock verifier is
 // reachable only with NETCODE_ALLOW_MOCK_AUTH=1 outside production.
 const auth = verifierFromEnv(process.env, mockTokenVerifier);
@@ -112,15 +115,25 @@ const server = http.createServer((req, res) => {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       try {
-        const { world_id } = JSON.parse(body || '{}');
+        const { world_id, max_players } = JSON.parse(body || '{}');
         if (!world_id) {
           res.writeHead(400, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'world_id required' }));
           return;
         }
-        const session = sessionManager.createSession(world_id);
+        if (!isValidWorldId(world_id)) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid world_id (expected /^[A-Za-z0-9._:-]{1,200}$/)' }));
+          return;
+        }
+        if (max_players !== undefined && !(Number.isInteger(max_players) && max_players >= 1)) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'max_players must be a positive integer' }));
+          return;
+        }
+        const session = sessionManager.createSession(world_id, { maxPlayers: max_players });
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ session_id: session.session_id, world_id }));
+        res.end(JSON.stringify({ session_id: session.session_id, world_id, max_players: session.maxPlayers }));
       } catch {
         res.writeHead(400, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: 'bad json' }));

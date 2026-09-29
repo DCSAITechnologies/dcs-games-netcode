@@ -317,8 +317,22 @@ async function run(): Promise<boolean> {
     const mis = await mk();
     mis.send({ type: 'join', token: tok('mallory'), world_id: 'some-other-world', session_id: sessionId });
     const mj = await mis.waitFor((f) => f.type === 'joined' || f.type === 'error');
-    if (mj?.type === 'joined') note('join with world_id != session.world_id is ACCEPTED (gateway.ts:104-109 never compares world_id); no max-players cap either');
+    check('join with world_id != session.world_id → error world_mismatch', mj?.type === 'error' && mj?.code === 'world_mismatch');
     mis.close();
+    const badWorld = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: '../etc/passwd' }) });
+    check('POST /sessions with malformed world_id → 400', badWorld.status === 400);
+
+    // Max players over the wire: a 1-seat session refuses the second player.
+    const tiny = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: WORLD, max_players: 1 }) });
+    check('POST /sessions {max_players:1} → echoes max_players', tiny.body?.max_players === 1);
+    const t1 = await mk();
+    t1.send({ type: 'join', token: tok('tina'), world_id: WORLD, session_id: tiny.body?.session_id });
+    const t1j = await t1.waitFor((f) => f.type === 'joined' || f.type === 'error');
+    const t2 = await mk();
+    t2.send({ type: 'join', token: tok('tom'), world_id: WORLD, session_id: tiny.body?.session_id });
+    const t2j = await t2.waitFor((f) => f.type === 'joined' || f.type === 'error');
+    check('second join into a 1-seat session → error session_full', t1j?.type === 'joined' && t2j?.code === 'session_full');
+    t1.close(); t2.close();
     await sleep(100);
 
     // ===== Disconnect / reconnect with state resume =====
