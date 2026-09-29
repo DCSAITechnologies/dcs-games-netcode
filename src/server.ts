@@ -10,7 +10,7 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { SessionManager } from './session.js';
+import { SessionManager, SessionCapError } from './session.js';
 import { Gateway, mockTokenVerifier, Transport } from './gateway.js';
 import type { OutboundFrame, InboundFrame, C3Delta } from './types.js';
 import { deltaSinkFromEnv } from './persistence-client.js';
@@ -100,7 +100,12 @@ const persistence = deltaSinkFromEnv();
 const c3Sink = (d: C3Delta) => persistence.emit(d);
 
 const limits = limitsFromEnv(process.env);
-const sessionManager = new SessionManager(c3Sink, undefined, { maxPlayersPerSession: limits.maxPlayersPerSession });
+const sessionManager = new SessionManager(c3Sink, undefined, {
+  maxPlayersPerSession: limits.maxPlayersPerSession,
+  maxSessions: limits.maxSessions,
+  idleTtlMs: limits.sessionIdleMs,
+});
+sessionManager.startGc(limits.sessionGcIntervalMs); // unref'd
 // Auth: HS256 JWT (NETCODE_JWT_SECRET) or fail closed. The mock verifier is
 // reachable only with NETCODE_ALLOW_MOCK_AUTH=1 outside production.
 const auth = verifierFromEnv(process.env, mockTokenVerifier);
@@ -131,7 +136,17 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({ error: 'max_players must be a positive integer' }));
           return;
         }
-        const session = sessionManager.createSession(world_id, { maxPlayers: max_players });
+        let session;
+        try {
+          session = sessionManager.createSession(world_id, { maxPlayers: max_players });
+        } catch (err) {
+          if (err instanceof SessionCapError) {
+            res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '30' });
+            res.end(JSON.stringify({ error: 'session cap reached', code: 'capacity' }));
+            return;
+          }
+          throw err;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ session_id: session.session_id, world_id, max_players: session.maxPlayers }));
       } catch {
@@ -161,6 +176,8 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       active_sessions: sessionManager.activeSessionCount,
+      max_sessions: sessionManager.maxSessions,
+      sessions_gc_closed: sessionManager.gcClosed,
       auth: auth.mode,
       persistence: { mode: process.env.CW5_PERSISTENCE_URL ? 'live' : 'local', deltas_emitted: persistence.count },
     }));
@@ -223,5 +240,6 @@ server.listen(PORT, () => {
 
 process.on('SIGINT', () => {
   console.log('\n[CW4 mock] shutting down');
+  sessionManager.closeAll();
   server.close(() => process.exit(0));
 });

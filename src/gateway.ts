@@ -13,7 +13,7 @@ import {
   PartyLaunchFrame,
   PartyLeaveFrame,
 } from './types.js';
-import { Session, SessionManager, ClientConn } from './session.js';
+import { Session, SessionManager, ClientConn, SessionCapError } from './session.js';
 import { isValidWorldId } from './validation.js';
 
 /**
@@ -137,7 +137,15 @@ export class Gateway {
         return;
       }
     } else {
-      session = this.sessionManager.createSession(frame.world_id);
+      try {
+        session = this.sessionManager.createSession(frame.world_id);
+      } catch (err) {
+        if (err instanceof SessionCapError) {
+          transport.send({ type: 'error', code: 'capacity', message: 'server is at its session cap; try again later' });
+          return;
+        }
+        throw err;
+      }
     }
 
     // 3. Allocate stable entity id (deterministic from user_id + session)
@@ -230,7 +238,16 @@ export class Gateway {
           transport.send({ type: 'error', code: 'forbidden', message: 'only leader can launch' });
           return;
         }
-        const session = this.sessionManager.createSession(party.world_id);
+        let session: Session;
+        try {
+          session = this.sessionManager.createSession(party.world_id);
+        } catch (err) {
+          if (err instanceof SessionCapError) {
+            transport.send({ type: 'error', code: 'capacity', message: 'server is at its session cap; try again later' });
+            return;
+          }
+          throw err;
+        }
         const res = this.party.launchParty(frame.party_id, session.session_id);
         if (!res.ok) {
           transport.send({ type: 'error', code: 'invalid', message: res.error || 'launch failed' });

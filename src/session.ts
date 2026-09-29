@@ -70,6 +70,9 @@ export interface SessionOptions {
 /** Thrown by Session.join when the session has no free seat. */
 export class SessionFullError extends Error {}
 
+/** Thrown by SessionManager.createSession when the server is at its session cap. */
+export class SessionCapError extends Error {}
+
 /**
  * Authoritative game session. One per active world instance.
  */
@@ -105,6 +108,10 @@ export class Session {
   // Keyframe (full state) every N ticks to let clients resync (guards drift).
   static KEYFRAME_EVERY_TICKS = 30; // 2s at 15Hz
 
+  /** ms timestamp of the last join/leave/frame/grace-expiry — drives idle GC. */
+  lastActivityAt = Date.now();
+  // Max invite codes a session retains (oldest evicted) — POST /invite cannot grow memory without bound.
+  static MAX_INVITES = 256;
   // Max players per session when not specified at creation.
   static DEFAULT_MAX_PLAYERS = 16;
   readonly maxPlayers: number;
@@ -137,6 +144,27 @@ export class Session {
     this.lastSent.clear();
     this.lastInputSeq.clear();
     this.lastInputAt.clear();
+    this.rateLimiter.reset();
+    this.inviteCodes.clear();
+  }
+
+  /** No connected players and nobody held in the reconnect grace window. */
+  get isEmpty(): boolean {
+    return this.players.size === 0 && this.disconnected.size === 0;
+  }
+
+  /**
+   * Forget every per-entity record except lastSent (runTick turns that into a
+   * removed[] entry and clears it). Called when a player is gone for good:
+   * hard quit, or reconnect grace expired.
+   */
+  private purgeEntity(entity_id: string) {
+    const held = this.disconnected.get(entity_id);
+    if (held) { clearTimeout(held.timer); this.disconnected.delete(entity_id); }
+    this.lastInputSeq.delete(entity_id);
+    this.lastInputAt.delete(entity_id);
+    this.aoiSeen.delete(entity_id); // this player's own visibility map
+    this.rateLimiter.resetPrefix(`${entity_id}:`);
   }
 
   get currentTick() {
@@ -165,6 +193,7 @@ export class Session {
 
   join(conn: ClientConn): WorldSnapshot {
     if (!this.canAdmit(conn.entity_id)) throw new SessionFullError(`session ${this.session_id} is full (${this.maxPlayers})`);
+    this.lastActivityAt = Date.now();
     // Reconnect/resume: if this entity is in the disconnected grace window,
     // reattach to its PRESERVED state (position/health/vel) instead of respawning.
     const held = this.disconnected.get(conn.entity_id);
@@ -222,12 +251,10 @@ export class Session {
     this.conns.delete(entity_id);
     this.broadcast({ type: 'despawn', entity_id });
 
+    this.lastActivityAt = Date.now();
     if (opts?.hard || !player) {
       // Explicit quit (or unknown entity) — drop any held state too.
-      const held = this.disconnected.get(entity_id);
-      if (held) { clearTimeout(held.timer); this.disconnected.delete(entity_id); }
-      this.lastInputSeq.delete(entity_id);
-      this.aoiSeen.delete(entity_id); // this player's own visibility map
+      this.purgeEntity(entity_id);
       // NOTE: do NOT delete lastSent here — runTick detects the entity is gone
       // from players[] and emits it in removed[], then clears lastSent itself.
       // (Under AOI, other recipients' aoiSeen maps self-clean via removed[].)
@@ -237,8 +264,9 @@ export class Session {
     // Soft disconnect: preserve state for the grace window.
     // (lastInputSeq is intentionally kept so a reconnecting client's seq stays monotonic.)
     const timer = setTimeout(() => {
-      this.disconnected.delete(entity_id); // grace expired → permanent removal
-      this.lastInputSeq.delete(entity_id);
+      // Grace expired → permanent removal of every per-player record.
+      this.purgeEntity(entity_id);
+      this.lastActivityAt = Date.now();
     }, Session.RECONNECT_GRACE_MS);
     // Don't keep the event loop alive solely for the grace timer (CI-friendly).
     if (typeof (timer as any).unref === 'function') (timer as any).unref();
@@ -256,6 +284,10 @@ export class Session {
 
   createInvite(): string {
     const code = crypto.randomBytes(4).toString('hex');
+    if (this.inviteCodes.size >= Session.MAX_INVITES) {
+      const oldest = this.inviteCodes.values().next().value;
+      if (oldest !== undefined) this.inviteCodes.delete(oldest);
+    }
     this.inviteCodes.add(code);
     return code;
   }
@@ -269,6 +301,7 @@ export class Session {
   handleFrame(entity_id: string, frame: InboundFrame): void {
     const conn = this.conns.get(entity_id);
     if (!conn) return;
+    this.lastActivityAt = Date.now();
 
     switch (frame.type) {
       case 'input':
@@ -599,6 +632,10 @@ export class Session {
 export interface SessionManagerOptions {
   /** Server-wide max players per session (default Session.DEFAULT_MAX_PLAYERS = 16). */
   maxPlayersPerSession?: number;
+  /** Max concurrent sessions (default 500). Creation beyond it throws SessionCapError. */
+  maxSessions?: number;
+  /** An empty session (no players, no reconnect holds) idle this long is closed (default 60s). */
+  idleTtlMs?: number;
 }
 
 /**
@@ -612,16 +649,64 @@ export class SessionManager {
 
   /** Server-wide ceiling on seats per session. */
   readonly maxPlayersPerSession: number;
+  readonly maxSessions: number;
+  readonly idleTtlMs: number;
+  private gcTimer: ReturnType<typeof setInterval> | null = null;
+  /** Sessions closed by GC since boot (diagnostics / /health). */
+  gcClosed = 0;
+
+  static DEFAULT_MAX_SESSIONS = 500;
+  static DEFAULT_IDLE_TTL_MS = 60_000;
 
   constructor(c3Sink: C3Sink, ownership?: OwnershipStore, opts?: SessionManagerOptions) {
     this.c3Sink = c3Sink;
     this.ownership = ownership;
-    const mp = opts?.maxPlayersPerSession;
-    this.maxPlayersPerSession = Number.isInteger(mp) && (mp as number) >= 1 ? (mp as number) : Session.DEFAULT_MAX_PLAYERS;
+    const posInt = (v: unknown, d: number) => (Number.isInteger(v) && (v as number) >= 1 ? (v as number) : d);
+    this.maxPlayersPerSession = posInt(opts?.maxPlayersPerSession, Session.DEFAULT_MAX_PLAYERS);
+    this.maxSessions = posInt(opts?.maxSessions, SessionManager.DEFAULT_MAX_SESSIONS);
+    this.idleTtlMs = typeof opts?.idleTtlMs === 'number' && opts.idleTtlMs >= 0 ? opts.idleTtlMs : SessionManager.DEFAULT_IDLE_TTL_MS;
+  }
+
+  /**
+   * Close every session that is empty (no players, no reconnect holds) and has
+   * been idle for idleTtlMs. Returns the closed ids. A freshly POSTed session
+   * nobody joins is empty from birth, so it is reclaimed after idleTtlMs too.
+   */
+  sweep(now: number = Date.now()): string[] {
+    const closed: string[] = [];
+    for (const [id, s] of this.sessions) {
+      if (s.isEmpty && now - s.lastActivityAt >= this.idleTtlMs) {
+        this.closeSession(id);
+        closed.push(id);
+      }
+    }
+    this.gcClosed += closed.length;
+    return closed;
+  }
+
+  /** Run sweep() every intervalMs. The timer is unref'd: it never holds the process open. */
+  startGc(intervalMs: number) {
+    if (this.gcTimer) return;
+    this.gcTimer = setInterval(() => this.sweep(), Math.max(10, intervalMs));
+    if (typeof (this.gcTimer as any).unref === 'function') (this.gcTimer as any).unref();
+  }
+
+  stopGc() {
+    if (this.gcTimer) { clearInterval(this.gcTimer); this.gcTimer = null; }
+  }
+
+  /** Stop GC and close every session (shutdown / tests). */
+  closeAll() {
+    this.stopGc();
+    for (const id of Array.from(this.sessions.keys())) this.closeSession(id);
   }
 
   createSession(world_id: string, opts?: SessionOptions): Session {
     if (!isValidWorldId(world_id)) throw new Error(`invalid world_id: ${String(world_id).slice(0, 64)}`);
+    if (this.sessions.size >= this.maxSessions) {
+      this.sweep(); // reclaim idle sessions before refusing
+      if (this.sessions.size >= this.maxSessions) throw new SessionCapError(`session cap reached (${this.maxSessions})`);
+    }
     // A per-session cap may lower the server's cap, never raise it.
     const cap = this.maxPlayersPerSession;
     const requested = opts?.maxPlayers;

@@ -219,6 +219,15 @@ export class RateLimiter {
     return false;
   }
 
+  /** Drop every bucket whose key starts with `prefix` (per-entity cleanup). */
+  resetPrefix(prefix: string) {
+    for (const k of this.buckets.keys()) if (k.startsWith(prefix)) this.buckets.delete(k);
+  }
+
+  get size(): number {
+    return this.buckets.size;
+  }
+
   reset(key?: string) {
     if (key) this.buckets.delete(key);
     else this.buckets.clear();
