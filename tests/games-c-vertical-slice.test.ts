@@ -296,12 +296,13 @@ async function run(): Promise<boolean> {
     check('input flood (45 burst) → rate_limit (30/s bucket)', bob.since(bMark).some((f) => f.type === 'error' && f.code === 'rate_limit'));
 
     bMark = bob.mark();
-    bob.sendRaw('{' + 'a'.repeat(256 * 1024));
+    bob.sendRaw('{' + 'a'.repeat(1024));
     const junk = await bob.waitFor((f) => f.type === 'error' && f.code === 'invalid', bMark);
-    check('256 KiB malformed frame → error invalid, connection survives', !!junk && !bob.closed);
+    check('1 KiB malformed frame → error invalid, connection survives', !!junk && !bob.closed);
     const h2 = await httpJson(`${base}/health`);
     check('server still healthy after junk frame', h2.body?.ok === true);
-    note('no WS payload size cap: 256 KiB frame was fully buffered + parsed (server.ts:50-83 accepts lengths up to 2^64)');
+    // Oversized frames are covered in tests/server-limits.test.ts (a 256 KiB
+    // frame now closes the socket with 1009 instead of being buffered + parsed).
 
     // Party / inventory on the DEPLOYED entrypoint.
     bMark = bob.mark();

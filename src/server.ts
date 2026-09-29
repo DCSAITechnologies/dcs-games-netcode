@@ -48,12 +48,40 @@ function encodeTextFrame(str: string): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-type DecodedMessage = { close: true } | { text: string } | { ping: true };
+type DecodedMessage =
+  | { close: true }
+  | { text: string }
+  | { ping: Buffer }
+  // Fatal: the connection must be closed with this RFC6455 status code.
+  | { fatal: 1002 | 1009; reason: string };
 
-function createFrameDecoder(): (chunk: Buffer) => DecodedMessage[] {
-  let buffer = Buffer.alloc(0);
+/** A server→client close frame carrying a status code. */
+function encodeCloseFrame(code: number): Buffer {
+  const f = Buffer.alloc(4);
+  f[0] = 0x88;
+  f[1] = 2;
+  f.writeUInt16BE(code, 2);
+  return f;
+}
+
+function encodePongFrame(payload: Buffer): Buffer {
+  const p = payload.subarray(0, 125);
+  return Buffer.concat([Buffer.from([0x8a, p.length]), p]);
+}
+
+/**
+ * Incremental RFC6455 decoder with a hard payload cap. The declared length is
+ * checked as soon as the header is readable — BEFORE the payload is buffered —
+ * so an oversized frame costs at most a header's worth of memory, then the
+ * connection is closed with 1009 (message too big). Client frames must be
+ * masked (RFC6455 §5.1); an unmasked one is a protocol error (1002).
+ */
+function createFrameDecoder(maxPayload: number): (chunk: Buffer) => DecodedMessage[] {
+  let buffer: Buffer = Buffer.alloc(0);
+  let dead = false;
   return function decode(chunk: Buffer): DecodedMessage[] {
-    buffer = Buffer.concat([buffer, chunk]);
+    if (dead) return [];
+    buffer = buffer.length ? Buffer.concat([buffer, chunk]) : chunk;
     const messages: DecodedMessage[] = [];
     while (buffer.length >= 2) {
       const opcode = buffer[0] & 0x0f;
@@ -66,24 +94,73 @@ function createFrameDecoder(): (chunk: Buffer) => DecodedMessage[] {
         offset = 4;
       } else if (len === 127) {
         if (buffer.length < 10) break;
-        len = Number(buffer.readBigUInt64BE(2));
+        const big = buffer.readBigUInt64BE(2);
+        len = big > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(big);
         offset = 10;
       }
-      const maskLen = masked ? 4 : 0;
-      if (buffer.length < offset + maskLen + len) break;
-      const mask = masked ? buffer.subarray(offset, offset + 4) : null;
-      const dataStart = offset + maskLen;
-      const data = buffer.subarray(dataStart, dataStart + len);
-      if (masked && mask) {
-        for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+      if (len > maxPayload) {
+        dead = true;
+        buffer = Buffer.alloc(0);
+        messages.push({ fatal: 1009, reason: `frame of ${len} bytes exceeds ${maxPayload}` });
+        return messages;
       }
+      if (!masked) {
+        dead = true;
+        buffer = Buffer.alloc(0);
+        messages.push({ fatal: 1002, reason: 'client frames must be masked' });
+        return messages;
+      }
+      if (buffer.length < offset + 4 + len) break;
+      const mask = buffer.subarray(offset, offset + 4);
+      const dataStart = offset + 4;
+      // Copy out so the (possibly shared) input chunk is never mutated in place.
+      const data = Buffer.from(buffer.subarray(dataStart, dataStart + len));
+      for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
       buffer = buffer.subarray(dataStart + len);
       if (opcode === 0x08) messages.push({ close: true });
       else if (opcode === 0x01 || opcode === 0x00) messages.push({ text: data.toString('utf8') });
-      else if (opcode === 0x09) messages.push({ ping: true });
+      else if (opcode === 0x09) messages.push({ ping: data });
     }
     return messages;
   };
+}
+
+/**
+ * Read a request body up to `max` bytes. Resolves the body, or null after it has
+ * already answered 413 and arranged for the connection to close. Never buffers
+ * more than `max` bytes: a declared Content-Length over the cap is refused
+ * before reading, and a streamed (chunked) body is cut off the moment it passes.
+ */
+function readBody(req: http.IncomingMessage, res: http.ServerResponse, max: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const tooLarge = () => {
+      if (!res.headersSent) {
+        res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+        res.end(JSON.stringify({ error: 'body too large', max_bytes: max }));
+      }
+      res.on('finish', () => req.socket.destroy());
+      resolve(null);
+    };
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > max) { tooLarge(); return; }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    req.on('data', (c: Buffer) => {
+      if (done) return;
+      size += c.length;
+      if (size > max) {
+        done = true;
+        chunks.length = 0;
+        req.pause();
+        tooLarge();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
+    req.on('error', () => { if (!done) { done = true; resolve(null); } });
+  });
 }
 
 // ---- Wiring ----
@@ -115,44 +192,40 @@ else console.log('[auth] HS256 JWT verification enabled');
 const gateway = new Gateway(sessionManager, auth.verifier);
 
 const server = http.createServer((req, res) => {
+  // No route accepts a large body; refuse an over-cap declared length up front.
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > limits.maxHttpBody) {
+    res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+    res.end(JSON.stringify({ error: 'body too large', max_bytes: limits.maxHttpBody }));
+    res.on('finish', () => req.socket.destroy());
+    return;
+  }
   if (req.method === 'POST' && req.url === '/sessions') {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      try {
-        const { world_id, max_players } = JSON.parse(body || '{}');
-        if (!world_id) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'world_id required' }));
-          return;
-        }
-        if (!isValidWorldId(world_id)) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'invalid world_id (expected /^[A-Za-z0-9._:-]{1,200}$/)' }));
-          return;
-        }
-        if (max_players !== undefined && !(Number.isInteger(max_players) && max_players >= 1)) {
-          res.writeHead(400, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'max_players must be a positive integer' }));
-          return;
-        }
-        let session;
-        try {
-          session = sessionManager.createSession(world_id, { maxPlayers: max_players });
-        } catch (err) {
-          if (err instanceof SessionCapError) {
-            res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '30' });
-            res.end(JSON.stringify({ error: 'session cap reached', code: 'capacity' }));
-            return;
-          }
-          throw err;
-        }
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ session_id: session.session_id, world_id, max_players: session.maxPlayers }));
-      } catch {
-        res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: 'bad json' }));
+    void readBody(req, res, limits.maxHttpBody).then((body) => {
+      if (body === null) return; // 413 already sent
+      const json = (status: number, obj: unknown, extra: Record<string, string> = {}) => {
+        res.writeHead(status, { 'content-type': 'application/json', ...extra });
+        res.end(JSON.stringify(obj));
+      };
+      let parsed: any;
+      try { parsed = JSON.parse(body || '{}'); } catch { json(400, { error: 'bad json' }); return; }
+      const world_id = parsed?.world_id;
+      const max_players = parsed?.max_players;
+      if (!world_id) { json(400, { error: 'world_id required' }); return; }
+      if (!isValidWorldId(world_id)) { json(400, { error: 'invalid world_id (expected /^[A-Za-z0-9._:-]{1,200}$/)' }); return; }
+      if (max_players !== undefined && !(Number.isInteger(max_players) && max_players >= 1)) {
+        json(400, { error: 'max_players must be a positive integer' });
+        return;
       }
+      let session;
+      try {
+        session = sessionManager.createSession(world_id, { maxPlayers: max_players });
+      } catch (err) {
+        if (err instanceof SessionCapError) { json(503, { error: 'session cap reached', code: 'capacity' }, { 'retry-after': '30' }); return; }
+        json(500, { error: 'could not create session' });
+        return;
+      }
+      json(200, { session_id: session.session_id, world_id, max_players: session.maxPlayers });
     });
     return;
   }
@@ -207,11 +280,25 @@ server.on('upgrade', (req, socket, head) => {
     close: () => socket.end(),
   };
 
-  const decode = createFrameDecoder();
+  const decode = createFrameDecoder(limits.maxWsPayload);
   const pump = (chunk: Buffer) => {
     for (const msg of decode(chunk)) {
+      if ('fatal' in msg) {
+        // Oversized (1009) or unmasked (1002): close, never buffer the rest.
+        socket.removeListener('data', pump);
+        gateway.handleDisconnect(transport);
+        try { socket.write(encodeCloseFrame(msg.fatal)); } catch { /* closed */ }
+        socket.end();
+        setTimeout(() => socket.destroy(), 1000).unref();
+        return;
+      }
+      if ('ping' in msg) {
+        try { socket.write(encodePongFrame(msg.ping)); } catch { /* closed */ }
+        continue;
+      }
       if ('close' in msg) {
         gateway.handleDisconnect(transport);
+        try { socket.write(encodeCloseFrame(1000)); } catch { /* closed */ }
         socket.end();
         return;
       }
@@ -231,6 +318,10 @@ server.on('upgrade', (req, socket, head) => {
   socket.on('close', () => gateway.handleDisconnect(transport));
   socket.on('error', () => gateway.handleDisconnect(transport));
 });
+
+// Slow-loris guards on the HTTP side.
+server.headersTimeout = 10_000;
+server.requestTimeout = 15_000;
 
 server.listen(PORT, () => {
   console.log(`[CW4 mock] WS gateway up on ws://localhost:${PORT}/play`);
