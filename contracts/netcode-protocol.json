@@ -102,9 +102,12 @@
   },
   "owns_in_C4": [
     "wss://.../play",
-    "POST /sessions {world_id, max_players?, spawn_points?: [{id?, position}], spawn_seed?} -> {session_id, world_id, max_players, spawn_points}",
-    "POST /sessions/:id/invite"
+    "POST /sessions {world_id, max_players?, spawn_points?: [{id?, position}], spawn_seed?} (Bearer JWT; 401 without, 429 over NETCODE_MAX_SESSIONS_PER_USER) -> {session_id, world_id, max_players, spawn_points, hydrated, objects} after persistence replay",
+    "POST /sessions/:id/invite (Bearer JWT; owner or member of the same tenant, else 404)",
+    "GET /sessions/:id (Bearer JWT; presence view: players_online, players_held_for_reconnect, hydrated)"
   ],
+  "feature_flag": "NETCODE_MULTIPLAYER_ENABLED (default OFF): every route above answers 404 and /play is refused with HTTP 404",
+  "auth_http": "POST /sessions requires Authorization: Bearer <JWT>; the caller becomes session owner, its tenant_id claim the session tenant",
   "limits": {
     "ws_max_payload_bytes": "NETCODE_MAX_WS_PAYLOAD (default 65536); larger frame -> close 1009",
     "ws_client_frames_masked": "required; unmasked -> close 1002",

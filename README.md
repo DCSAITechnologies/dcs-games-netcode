@@ -38,6 +38,11 @@ npm start          # boots the WS server: node dist/server.js
 | `NETCODE_SESSION_IDLE_MS` / `NETCODE_SESSION_GC_INTERVAL_MS` | empty-session idle TTL / GC sweep interval | 60000 / 10000 |
 | `NETCODE_MAX_WS_PAYLOAD` | max bytes per WS frame (larger → close 1009) | 65536 |
 | `NETCODE_MAX_HTTP_BODY` | max HTTP body bytes (larger → 413) | 16384 |
+| `NETCODE_MULTIPLAYER_ENABLED` | **feature flag.** `1/true/yes/on` = on. OFF: only `GET /health` → `{ok:true,multiplayer:"off"}`; `/sessions*` and the `/play` upgrade → 404; no auth, sessions, sink or replay are built | **unset → OFF** |
+| `NETCODE_REQUIRE_WORLD_TICKET` | joins, `party_create` and `POST /sessions` need a backend-minted ticket (token with a `world_id` claim equal to the world) | ON when `NODE_ENV=production`, else OFF |
+| `NETCODE_MAX_SESSIONS_PER_USER` | live sessions one user may own (beyond → 429 / error `capacity`) | 5 |
+| `NETCODE_MAX_PARTY_SIZE` | members per party | 4 |
+| `NETCODE_REPLAY_MAX_DELTAS` / `NETCODE_REPLAY_TIMEOUT_MS` | persistence replay caps (per new session) | 20000 / 5000 |
 | `NETCODE_PERSISTENCE_URL` (alias `CW5_PERSISTENCE_URL`) | backend base URL for deltas | unset → no-op sink (warning logged) |
 | `NETCODE_PERSISTENCE_PATH` (alias `CW5_INGEST_PATH`) | ingest path | `/persistence/delta` |
 | `NETCODE_PERSISTENCE_TOKEN` (alias `CW5_PERSISTENCE_TOKEN`) | service bearer for ingest | — |
@@ -49,7 +54,18 @@ npm start          # boots the WS server: node dist/server.js
 Per-session FIFO; 408/429/5xx/network/timeout retried with jittered backoff (Retry-After honoured);
 other 4xx dropped. `emit()` is synchronous and bounded — it never blocks the tick. With no URL the
 sink is a no-op. `/health` reports `auth`, `persistence.{mode,deltas_emitted,deltas_dropped}`,
-`active_sessions`, `max_sessions`, `sessions_gc_closed`. **The backend route does not exist yet.**
+`active_sessions`, `max_sessions`, `sessions_gc_closed`. The backend side is
+`backend/persistence-delta/` (one registration function + `REGISTRATION.patch` for `server.mts`;
+see its README) — it is not yet applied to the backend.
+
+**HTTP routes are authenticated** (`Authorization: Bearer <JWT>`): `POST /sessions` records the caller as
+owner and its `tenant_id` claim as the session tenant; `GET /sessions/:id` (presence view) and
+`POST /sessions/:id/invite` answer only the owner or a current member of the same tenant (else 404).
+Joins and party ops from another tenant are refused.
+
+**Persistence replay:** a new session loads `GET <base><path>/replay?world_id=` and rebuilds objects (re-owned by
+each user's entity in the new session) and per-user inventories; `POST /sessions` returns only after replay.
+Replay never re-emits deltas.
 
 After deploy, give CW3/CW6 the `wss://<service>.railway.app/play` URL.
 
