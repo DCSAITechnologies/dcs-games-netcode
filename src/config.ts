@@ -16,6 +16,10 @@ export interface ServerLimits {
   maxWsPayload: number;
   /** NETCODE_MAX_HTTP_BODY — max HTTP request body bytes; larger → 413 + close. */
   maxHttpBody: number;
+  /** NETCODE_MAX_SESSIONS_PER_USER — live sessions one user may own. */
+  maxSessionsPerUser: number;
+  /** NETCODE_MAX_PARTY_SIZE — members per party. */
+  maxPartySize: number;
 }
 
 export const DEFAULT_LIMITS: ServerLimits = {
@@ -25,6 +29,8 @@ export const DEFAULT_LIMITS: ServerLimits = {
   sessionGcIntervalMs: 10_000,
   maxWsPayload: 64 * 1024,
   maxHttpBody: 16 * 1024,
+  maxSessionsPerUser: 5,
+  maxPartySize: 4,
 };
 
 /** Parse a positive integer env var, clamped to [min, max]; default on absence/garbage. */
@@ -43,5 +49,19 @@ export function limitsFromEnv(env: Record<string, string | undefined>): ServerLi
     sessionGcIntervalMs: intEnv(env.NETCODE_SESSION_GC_INTERVAL_MS, DEFAULT_LIMITS.sessionGcIntervalMs, 100, 3600_000),
     maxWsPayload: intEnv(env.NETCODE_MAX_WS_PAYLOAD, DEFAULT_LIMITS.maxWsPayload, 1024, 16 * 1024 * 1024),
     maxHttpBody: intEnv(env.NETCODE_MAX_HTTP_BODY, DEFAULT_LIMITS.maxHttpBody, 256, 1024 * 1024),
+    maxSessionsPerUser: intEnv(env.NETCODE_MAX_SESSIONS_PER_USER, DEFAULT_LIMITS.maxSessionsPerUser, 1, 1000),
+    maxPartySize: intEnv(env.NETCODE_MAX_PARTY_SIZE, DEFAULT_LIMITS.maxPartySize, 2, 64),
   };
+}
+
+/**
+ * NETCODE_REQUIRE_WORLD_TICKET: joins must present a backend-minted ticket
+ * (a token with a `world_id` claim). Default ON in production, OFF elsewhere;
+ * "0"/"1" override.
+ */
+export function requireWorldTicketFromEnv(env: Record<string, string | undefined>): boolean {
+  const raw = String(env.NETCODE_REQUIRE_WORLD_TICKET ?? '').trim();
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  return env.NODE_ENV === 'production';
 }

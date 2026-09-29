@@ -10,13 +10,18 @@
 
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { SessionManager, SessionCapError } from './session.js';
-import { Gateway, mockTokenVerifier, Transport } from './gateway.js';
+import { Session, SessionManager, SessionCapError, SessionQuotaError } from './session.js';
+import { Gateway, mockTokenVerifier, Transport, tenantOf } from './gateway.js';
 import type { OutboundFrame, InboundFrame, C3Delta } from './types.js';
 import { deltaSinkFromEnv } from './persistence-client.js';
 import { verifierFromEnv } from './auth.js';
 import { isValidWorldId, sanitizeSpawnPoints } from './validation.js';
-import { limitsFromEnv } from './config.js';
+import { limitsFromEnv, requireWorldTicketFromEnv } from './config.js';
+import { multiplayerFlag } from './feature-flag.js';
+import { replaySourceFromEnv } from './replay.js';
+import { PartyManager } from './party.js';
+import { PresenceService } from './presence.js';
+import { LiveOwnershipStore } from './inventory.js';
 
 // ---- Minimal RFC6455 WebSocket (server side, text frames) ----
 
@@ -172,25 +177,87 @@ const PORT = process.env.PORT
     ? Number(process.env.CW4_MOCK_PORT)
     : 8090;
 
-// Delta sink → backend persistence when NETCODE_PERSISTENCE_URL (alias CW5_PERSISTENCE_URL)
-// is set; otherwise a no-op with a logged warning. emit() never blocks the tick.
-const persistence = deltaSinkFromEnv();
-const c3Sink = (d: C3Delta) => persistence.emit(d);
-
 const limits = limitsFromEnv(process.env);
-const sessionManager = new SessionManager(c3Sink, undefined, {
-  maxPlayersPerSession: limits.maxPlayersPerSession,
-  maxSessions: limits.maxSessions,
-  idleTtlMs: limits.sessionIdleMs,
-});
-sessionManager.startGc(limits.sessionGcIntervalMs); // unref'd
-// Auth: HS256 JWT (NETCODE_JWT_SECRET) or fail closed. The mock verifier is
-// reachable only with NETCODE_ALLOW_MOCK_AUTH=1 outside production.
-const auth = verifierFromEnv(process.env, mockTokenVerifier);
-if (auth.mode === 'deny-all') console.error(`[auth] ${auth.warning}`);
-else if (auth.warning) console.warn(`[auth] ${auth.warning}`);
-else console.log('[auth] HS256 JWT verification enabled');
-const gateway = new Gateway(sessionManager, auth.verifier);
+
+// Multiplayer feature flag — default OFF (NETCODE_MULTIPLAYER_ENABLED=1 turns it on).
+// OFF builds nothing: no session manager, no auth, no persistence sink, no
+// replay. Every route but a minimal /health answers 404 and /play is refused.
+const flag = multiplayerFlag(process.env);
+
+interface Multiplayer {
+  sessionManager: SessionManager;
+  gateway: Gateway;
+  auth: ReturnType<typeof verifierFromEnv>;
+  persistence: ReturnType<typeof deltaSinkFromEnv>;
+  replay: ReturnType<typeof replaySourceFromEnv>;
+  party: PartyManager;
+  presence: PresenceService;
+  requireWorldTicket: boolean;
+}
+
+function buildMultiplayer(): Multiplayer {
+  // Delta sink → backend persistence when NETCODE_PERSISTENCE_URL (alias CW5_PERSISTENCE_URL)
+  // is set; otherwise a no-op with a logged warning. emit() never blocks the tick.
+  const persistence = deltaSinkFromEnv();
+  const c3Sink = (d: C3Delta) => persistence.emit(d);
+  // Persistence replay from the same backend; no URL → sessions start empty.
+  const replay = replaySourceFromEnv(process.env);
+  const party = new PartyManager(limits.maxPartySize);
+  // No friend-graph source is wired on this service yet: friendsPlaying() is empty.
+  const presence = new PresenceService(() => []);
+  const sessionManager: SessionManager = new SessionManager(c3Sink, new LiveOwnershipStore(), {
+    maxPlayersPerSession: limits.maxPlayersPerSession,
+    maxSessions: limits.maxSessions,
+    idleTtlMs: limits.sessionIdleMs,
+    maxSessionsPerUser: limits.maxSessionsPerUser,
+    hydrate: async (session) => {
+      const r = await replay.load(session.world_id);
+      if (r.ok) session.applyReplay(r.state);
+      else console.error(`[replay] ${session.world_id}: ${r.error} — session starts without persisted state`);
+    },
+    onClose: (id) => party.forgetSession(id),
+  });
+  sessionManager.startGc(limits.sessionGcIntervalMs); // unref'd
+  const partyGc = setInterval(() => party.sweep(Date.now(), (id) => !!sessionManager.getSession(id)), Math.max(100, limits.sessionGcIntervalMs));
+  partyGc.unref();
+  // Auth: HS256 JWT (NETCODE_JWT_SECRET) or fail closed. The mock verifier is
+  // reachable only with NETCODE_ALLOW_MOCK_AUTH=1 outside production.
+  const auth = verifierFromEnv(process.env, mockTokenVerifier);
+  if (auth.mode === 'deny-all') console.error(`[auth] ${auth.warning}`);
+  else if (auth.warning) console.warn(`[auth] ${auth.warning}`);
+  else console.log('[auth] HS256 JWT verification enabled');
+  const requireWorldTicket = requireWorldTicketFromEnv(process.env);
+  const gateway = new Gateway(sessionManager, auth.verifier, { party, presence, requireWorldTicket });
+  return { sessionManager, gateway, auth, persistence, replay, party, presence, requireWorldTicket };
+}
+
+const mp: Multiplayer | null = flag.enabled ? buildMultiplayer() : null;
+
+function json(res: http.ServerResponse, status: number, obj: unknown, extra: Record<string, string> = {}) {
+  res.writeHead(status, { 'content-type': 'application/json', ...extra });
+  res.end(JSON.stringify(obj));
+}
+
+/** The verified caller of an HTTP route (Authorization: Bearer <JWT>), or null. */
+function httpCaller(m: Multiplayer, req: http.IncomingMessage): { user_id: string; tenant: string | null; claims: Record<string, unknown> } | null {
+  const h = req.headers.authorization;
+  if (typeof h !== 'string' || !h.startsWith('Bearer ')) return null;
+  const v = m.auth.verifier(h.slice(7).trim());
+  if (!v.valid || !v.user_id) return null;
+  const t = tenantOf(v.claims);
+  if (!t.ok) return null;
+  return { user_id: v.user_id, tenant: t.tenant, claims: v.claims || {} };
+}
+
+/** May this caller see / act on this session? Same tenant AND (owner or current member). */
+function canSeeSession(session: Session, caller: { user_id: string; tenant: string | null }): boolean {
+  if ((session.tenant_id || null) !== caller.tenant) return false;
+  return session.owner_user_id === caller.user_id || session.hasMember(caller.user_id);
+}
+
+function notFound(res: http.ServerResponse) {
+  json(res, 404, { error: 'not found' });
+}
 
 const server = http.createServer((req, res) => {
   // No route accepts a large body; refuse an over-cap declared length up front.
@@ -201,76 +268,114 @@ const server = http.createServer((req, res) => {
     res.on('finish', () => req.socket.destroy());
     return;
   }
+
+  if (!mp) {
+    // Feature flag OFF: nothing but a liveness probe exists.
+    if (req.method === 'GET' && req.url === '/health') { json(res, 200, { ok: true, multiplayer: 'off' }); return; }
+    notFound(res);
+    return;
+  }
+  const { sessionManager, auth, persistence, replay, party } = mp;
+
   if (req.method === 'POST' && req.url === '/sessions') {
-    void readBody(req, res, limits.maxHttpBody).then((body) => {
+    const caller = httpCaller(mp, req);
+    if (!caller) { json(res, 401, { error: 'authentication required' }); req.resume(); return; }
+    void readBody(req, res, limits.maxHttpBody).then(async (body) => {
       if (body === null) return; // 413 already sent
-      const json = (status: number, obj: unknown, extra: Record<string, string> = {}) => {
-        res.writeHead(status, { 'content-type': 'application/json', ...extra });
-        res.end(JSON.stringify(obj));
-      };
       let parsed: any;
-      try { parsed = JSON.parse(body || '{}'); } catch { json(400, { error: 'bad json' }); return; }
+      try { parsed = JSON.parse(body || '{}'); } catch { json(res, 400, { error: 'bad json' }); return; }
       const world_id = parsed?.world_id;
       const max_players = parsed?.max_players;
-      if (!world_id) { json(400, { error: 'world_id required' }); return; }
-      if (!isValidWorldId(world_id)) { json(400, { error: 'invalid world_id (expected /^[A-Za-z0-9._:-]{1,200}$/)' }); return; }
+      if (!world_id) { json(res, 400, { error: 'world_id required' }); return; }
+      if (!isValidWorldId(world_id)) { json(res, 400, { error: 'invalid world_id (expected /^[A-Za-z0-9._:-]{1,200}$/)' }); return; }
+      const claimWorld = caller.claims.world_id;
+      if ((mp.requireWorldTicket && typeof claimWorld !== 'string') || (typeof claimWorld === 'string' && claimWorld !== world_id)) {
+        json(res, 403, { error: 'token is not valid for this world' });
+        return;
+      }
       if (max_players !== undefined && !(Number.isInteger(max_players) && max_players >= 1)) {
-        json(400, { error: 'max_players must be a positive integer' });
+        json(res, 400, { error: 'max_players must be a positive integer' });
         return;
       }
       const spawns = sanitizeSpawnPoints(parsed?.spawn_points);
-      if (!spawns.ok) { json(400, { error: spawns.error }); return; }
+      if (!spawns.ok) { json(res, 400, { error: spawns.error }); return; }
       const spawn_seed = parsed?.spawn_seed;
       if (spawn_seed !== undefined && !(typeof spawn_seed === 'string' && spawn_seed.length > 0 && spawn_seed.length <= 128)) {
-        json(400, { error: 'spawn_seed must be a string of 1..128 chars' });
+        json(res, 400, { error: 'spawn_seed must be a string of 1..128 chars' });
         return;
       }
       let session;
       try {
-        session = sessionManager.createSession(world_id, { maxPlayers: max_players, spawnPoints: spawns.points, spawnSeed: spawn_seed });
+        session = sessionManager.createSession(world_id, {
+          maxPlayers: max_players, spawnPoints: spawns.points, spawnSeed: spawn_seed,
+          ownerUserId: caller.user_id, tenantId: caller.tenant,
+        });
       } catch (err) {
-        if (err instanceof SessionCapError) { json(503, { error: 'session cap reached', code: 'capacity' }, { 'retry-after': '30' }); return; }
-        json(500, { error: 'could not create session' });
+        if (err instanceof SessionCapError) { json(res, 503, { error: 'session cap reached', code: 'capacity' }, { 'retry-after': '30' }); return; }
+        if (err instanceof SessionQuotaError) { json(res, 429, { error: err.message, code: 'quota' }); return; }
+        json(res, 500, { error: 'could not create session' });
         return;
       }
-      json(200, { session_id: session.session_id, world_id, max_players: session.maxPlayers, spawn_points: spawns.points.length });
+      // The id is handed out only once persisted state has been replayed into it.
+      await sessionManager.whenHydrated(session.session_id);
+      json(res, 200, {
+        session_id: session.session_id, world_id, max_players: session.maxPlayers,
+        spawn_points: spawns.points.length, hydrated: session.hydrated, objects: session.objectCount,
+      });
     });
     return;
   }
 
-  const inviteMatch = req.url && req.url.match(/^\/sessions\/([^/]+)\/invite$/);
-  if (req.method === 'POST' && inviteMatch) {
-    const session = sessionManager.getSession(inviteMatch[1]);
-    if (!session) {
-      res.writeHead(404, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: 'session not found' }));
+  const sessionMatch = req.url && req.url.match(/^\/sessions\/([^/]+)(\/invite)?$/);
+  if (sessionMatch && ((req.method === 'POST' && sessionMatch[2]) || (req.method === 'GET' && !sessionMatch[2]))) {
+    const caller = httpCaller(mp, req);
+    if (!caller) { json(res, 401, { error: 'authentication required' }); req.resume(); return; }
+    const session = sessionManager.getSession(sessionMatch[1]);
+    // Another tenant's (or a stranger's) session is indistinguishable from none.
+    if (!session || !canSeeSession(session, caller)) { json(res, 404, { error: 'session not found' }); req.resume(); return; }
+    if (sessionMatch[2]) {
+      const code = session.createInvite();
+      json(res, 200, { invite_code: code, session_id: session.session_id });
       return;
     }
-    const code = session.createInvite();
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ invite_code: code, session_id: session.session_id }));
+    // Presence view of one session.
+    json(res, 200, {
+      session_id: session.session_id,
+      world_id: session.world_id,
+      max_players: session.maxPlayers,
+      players_online: mp.presence.sessionPlayerCount(session.session_id),
+      players_held_for_reconnect: session.disconnectedCount,
+      hydrated: session.hydrated,
+    });
     return;
   }
 
   if (req.url === '/health') {
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({
+    json(res, 200, {
       ok: true,
+      multiplayer: 'on',
       active_sessions: sessionManager.activeSessionCount,
       max_sessions: sessionManager.maxSessions,
       sessions_gc_closed: sessionManager.gcClosed,
+      parties: party.activePartyCount,
       auth: auth.mode,
-      persistence: { mode: persistence.mode, deltas_emitted: persistence.count, deltas_dropped: persistence.dropped },
-    }));
+      world_ticket_required: mp.requireWorldTicket,
+      persistence: { mode: persistence.mode, deltas_emitted: persistence.count, deltas_dropped: persistence.dropped, replay: replay.mode },
+    });
     return;
   }
 
-  res.writeHead(404);
-  res.end('not found');
+  notFound(res);
 });
 
 server.on('upgrade', (req, socket, head) => {
-  if (req.url !== '/play') { socket.destroy(); return; }
+  if (!mp || req.url !== '/play') {
+    // Flag OFF (or any other path): the WebSocket endpoint does not exist.
+    try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); } catch { /* closed */ }
+    socket.destroy();
+    return;
+  }
+  const { gateway } = mp;
   const key = req.headers['sec-websocket-key'];
   if (!key || Array.isArray(key)) { socket.destroy(); return; }
 
@@ -332,13 +437,18 @@ server.headersTimeout = 10_000;
 server.requestTimeout = 15_000;
 
 server.listen(PORT, () => {
+  console.log(`[netcode] listening port=${PORT} multiplayer=${mp ? 'on' : 'off'}`);
+  if (!mp) {
+    console.log('[netcode] multiplayer feature flag OFF (NETCODE_MULTIPLAYER_ENABLED unset): /play, /sessions and invites answer 404');
+    return;
+  }
   console.log(`[CW4 mock] WS gateway up on ws://localhost:${PORT}/play`);
-  console.log(`[CW4 mock] HTTP: POST /sessions, POST /sessions/:id/invite, GET /health`);
-  console.log(`[CW4 mock] CW8/CW3 dial ws://localhost:${PORT}/play and send {type:'join',token:'<HS256 JWT>',world_id}. auth=${auth.mode}`);
+  console.log(`[CW4 mock] HTTP: POST /sessions, GET /sessions/:id, POST /sessions/:id/invite (Bearer JWT), GET /health`);
+  console.log(`[CW4 mock] CW8/CW3 dial ws://localhost:${PORT}/play and send {type:'join',token:'<HS256 JWT>',world_id}. auth=${mp.auth.mode}`);
 });
 
 process.on('SIGINT', () => {
-  console.log('\n[CW4 mock] shutting down');
-  sessionManager.closeAll();
+  console.log('\n[netcode] shutting down');
+  mp?.sessionManager.closeAll();
   server.close(() => process.exit(0));
 });
