@@ -17,9 +17,10 @@
     "in": {
       "join": {
         "type": "join",
-        "token": "string (CW1 auth token)",
-        "world_id": "string",
-        "session_id": "string (optional; join existing)"
+        "token": "string (HS256 JWT, sub = user id; see README auth)",
+        "world_id": "string (/^[A-Za-z0-9._:-]{1,200}$/, must equal the session's world_id)",
+        "session_id": "string (optional; join existing)",
+        "position": "vec3 (optional; if sent MUST equal the assigned spawn, else error invalid)"
       },
       "input": {
         "type": "input",
@@ -57,6 +58,7 @@
         "type": "joined",
         "session_id": "string",
         "your_entity_id": "string",
+        "spawn": "{id, position} (seeded pick from the session's spawn_points; {id:'origin'} at 0,0,0 when none; {id:'resume'} on reconnect)",
         "snapshot": "C3 snapshot (full world state at join)"
       },
       "state": {
@@ -91,7 +93,7 @@
       },
       "error": {
         "type": "error",
-        "code": "string (auth|invalid|rate_limit|not_found|forbidden)",
+        "code": "string (auth|invalid|rate_limit|not_found|forbidden|session_full|world_mismatch|capacity)",
         "message": "string",
         "ref_seq": "number (optional; which input failed)"
       },
@@ -100,9 +102,16 @@
   },
   "owns_in_C4": [
     "wss://.../play",
-    "POST /sessions {world_id}",
+    "POST /sessions {world_id, max_players?, spawn_points?: [{id?, position}], spawn_seed?} -> {session_id, world_id, max_players, spawn_points}",
     "POST /sessions/:id/invite"
   ],
+  "limits": {
+    "ws_max_payload_bytes": "NETCODE_MAX_WS_PAYLOAD (default 65536); larger frame -> close 1009",
+    "ws_client_frames_masked": "required; unmasked -> close 1002",
+    "http_max_body_bytes": "NETCODE_MAX_HTTP_BODY (default 16384); larger -> 413",
+    "max_players_per_session": "NETCODE_MAX_PLAYERS (default 16); join beyond -> error session_full",
+    "max_sessions": "NETCODE_MAX_SESSIONS (default 500); beyond -> 503 / error capacity"
+  },
   "c3_delta_emission": {
     "$comment": "Every validated mutation emits a C3 save-delta op to CW5. Shape RECONCILE against C3 save-delta.schema.json when Day0 lands.",
     "op_envelope": {
@@ -110,6 +119,7 @@
       "session_id": "string",
       "world_id": "string",
       "actor_entity_id": "string",
+      "actor_user_id": "string (optional; verified token sub)",
       "tick": "number",
       "payload": "object (op-specific)",
       "ts": "string (ISO)"

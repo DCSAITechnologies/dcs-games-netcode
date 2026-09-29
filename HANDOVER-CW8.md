@@ -23,8 +23,10 @@ Endpoints:
 1. `POST /sessions {world_id:"world-zombie-school"}` → get `session_id`.
 2. Open a WS to `/play`. Send a join frame:
    `{ "type":"join", "token":"tok:<user_id>", "world_id":"world-zombie-school", "session_id":"<id>" }`
-   - Token format for the mock CW1 verifier: `tok:<user_id>` (e.g. `tok:alice`). Real CW1 swaps in later.
-3. Server replies `{ "type":"joined", "session_id", "your_entity_id", "snapshot" }`.
+   - `src/server.ts` verifies HS256 JWTs (`NETCODE_JWT_SECRET`; `sub` = user id) and refuses every
+     join without a secret. The `tok:<user_id>` mock only works with `NETCODE_ALLOW_MOCK_AUTH=1`
+     outside `NODE_ENV=production` (the bundled `netcode-mock-server.mjs` still uses the mock).
+3. Server replies `{ "type":"joined", "session_id", "your_entity_id", "spawn", "snapshot" }`.
 4. Connect a second client the same way with the same `session_id`.
 5. Either client sends `{ "type":"place", "object_type":"house", "position":{x,y,z}, "rotation":{yaw} }`.
 6. The other client receives `{ "type":"object", "op":"place", ... }` within ~1 tick (15Hz).
@@ -48,7 +50,7 @@ delta is a full resync; otherwise apply `changed[]` and drop `removed[]`. Per-pl
 rides the delta for client reconciliation.
 
 ## What's mocked (swap points, not blockers for the cert)
-- **CW1 auth** → `mockTokenVerifier` accepts `tok:<user_id>`. Swap real CW1 identity when live.
+- **Auth** → the real server verifies HS256 JWTs (see README env table); `mockTokenVerifier` is test/dev only.
 - **CW5 ownership** → `MockOwnershipStore` for inventory. Swap CW5's `dcsgames_ownership` when shipped.
 - **C2/C3 vs canonical** → built against the inline C2 spec; reconcile vs `_SHARED_Day0/` (light verify) when the bundle lands.
 

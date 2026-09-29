@@ -25,15 +25,31 @@ npm start          # boots the WS server: node dist/server.js
 
 `railway.json` + `Procfile` included. Railway: `npm ci && npm run build` → `node dist/server.js`, healthcheck `/health`.
 
-**Env vars DK sets on the Railway service:**
+**Env vars (Railway service):**
 | Var | Purpose | Default |
 |---|---|---|
 | `PORT` | injected by Railway | 8090 (local) |
-| `CW5_PERSISTENCE_URL` | CW5 live persistence base (e.g. `https://api.games.dcsai.ai`) — **set this to go live** | unset → local sink |
-| `CW5_INGEST_PATH` | delta ingest path | `/persistence/delta` |
-| `CW5_PERSISTENCE_TOKEN` | optional bearer for ingest | — |
+| `NETCODE_JWT_SECRET` | HS256 secret (Supabase JWT secret, >= 32 chars). **Required** — without it every join is refused | unset → deny-all |
+| `NETCODE_JWT_ISSUER` / `NETCODE_JWT_AUDIENCE` | required `iss` / `aud` when set (Supabase: `https://<ref>.supabase.co/auth/v1` / `authenticated`) | not checked |
+| `NETCODE_JWT_CLOCK_SKEW_SEC` | skew for exp/nbf/iat | 30 |
+| `NETCODE_ALLOW_MOCK_AUTH` | `1` = accept unsigned `tok:<user_id>` — **dev only**, ignored when `NODE_ENV=production` or a secret is set | off |
+| `NETCODE_MAX_PLAYERS` | seats per session (POST /sessions `max_players` may lower it) | 16 |
+| `NETCODE_MAX_SESSIONS` | concurrent sessions per process | 500 |
+| `NETCODE_SESSION_IDLE_MS` / `NETCODE_SESSION_GC_INTERVAL_MS` | empty-session idle TTL / GC sweep interval | 60000 / 10000 |
+| `NETCODE_MAX_WS_PAYLOAD` | max bytes per WS frame (larger → close 1009) | 65536 |
+| `NETCODE_MAX_HTTP_BODY` | max HTTP body bytes (larger → 413) | 16384 |
+| `NETCODE_PERSISTENCE_URL` (alias `CW5_PERSISTENCE_URL`) | backend base URL for deltas | unset → no-op sink (warning logged) |
+| `NETCODE_PERSISTENCE_PATH` (alias `CW5_INGEST_PATH`) | ingest path | `/persistence/delta` |
+| `NETCODE_PERSISTENCE_TOKEN` (alias `CW5_PERSISTENCE_TOKEN`) | service bearer for ingest | — |
+| `NETCODE_PERSISTENCE_MAX_BYTES` / `_MAX_QUEUE` / `_TIMEOUT_MS` / `_MAX_RETRIES` | delta size cap / pending cap / per-attempt timeout / retries | 16384 / 1000 / 5000 / 3 |
 
-**C5 delta emission:** every validated mutation (place/remove/inventory) is forwarded to CW5 as a C5 delta via `HttpDeltaSink` (per-session FIFO ordering, retry/backoff on 5xx/429, no-retry on 4xx). With `CW5_PERSISTENCE_URL` unset it falls back to a local sink so the server runs standalone — **live cutover is env-only, no code change.** Verified E2E: WS place → C5 delta POSTed to CW5; `/health` reports `persistence.mode` + `deltas_emitted`.
+**Delta emission:** every validated mutation (place/remove/inventory) is POSTed as JSON
+`{delta_id, op, session_id, world_id, actor_entity_id, actor_user_id?, tick, payload, ts}` with
+`Authorization: Bearer <token>` and `Idempotency-Key: <delta_id>` (same id on every retry).
+Per-session FIFO; 408/429/5xx/network/timeout retried with jittered backoff (Retry-After honoured);
+other 4xx dropped. `emit()` is synchronous and bounded — it never blocks the tick. With no URL the
+sink is a no-op. `/health` reports `auth`, `persistence.{mode,deltas_emitted,deltas_dropped}`,
+`active_sessions`, `max_sessions`, `sessions_gc_closed`. **The backend route does not exist yet.**
 
 After deploy, give CW3/CW6 the `wss://<service>.railway.app/play` URL.
 
@@ -109,7 +125,7 @@ DCS-Games-CW4-Netcode/
 ### P0 status detail
 | Item | Status |
 |---|---|
-| WS gateway + auth handshake | ✅ (transport-agnostic; mockTokenVerifier for tests, swap real CW1) |
+| WS gateway + auth handshake | ✅ HS256 JWT verifier on the real server (`src/auth.ts`), fail-closed; mockTokenVerifier for tests only |
 | Session manager (create/join/leave/invite) | ✅ |
 | Tick loop @ 15Hz + state broadcast | ✅ |
 | Server-authoritative movement (anti-cheat) | ✅ (clamp jitter, reject speedhack/teleport/NaN/OOB) |
