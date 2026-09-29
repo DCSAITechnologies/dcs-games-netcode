@@ -1,0 +1,359 @@
+diff --git a/server.mts b/server.mts
+index 17a4c83..969dee2 100644
+--- a/server.mts
++++ b/server.mts
+@@ -54,6 +54,7 @@ import { interpret as companionInterpret, buildPatch as companionBuildPatch } fr
+ import { createWorldMemoryV2WithPatchModule, createFsAdapter } from "./src/v3/gamesc/memory/index.mjs";                  // GAMES-C: hash-chained version ledger
+ import { buildStagingPackage, atlasEnvSigner, createStagingRegistry, PublishError } from "./src/v3/gamesc/publish/index.mjs"; // GAMES-C: signed, content-addressed STAGING packages
+ import { guardManifest, guardUserPrompt, createUserDailyCap } from "./src/v3/gamesc/guard/index.mjs";                   // GAMES-C: manifest/prompt threat checks + spend cap
++import { registerPersistenceDelta } from "./src/v3/gamesc/persistence-delta/index.mjs";                              // GAMES-C: netcode delta ingest + replay (DCS_MULTIPLAYER_ENABLED, default OFF)
+ import { createGenerationEngine } from "./src/v3/engine/index.mjs";                                                       // GAMES-A: provider engine, local-only unless approved
+ 
+ const PORT = parseInt(process.env.PORT || "8080", 10);
+@@ -153,6 +154,23 @@ const safety = createSafetyService();                                        //
+ const social = createSocialService(process.env, { safety, subscriptions: subs });
+ const progression = createProgressionService({ social, worldMemory });
+ const repo = createWorldRepository();                                        // A3: replaces the process-local Map + swallowed best-effort insert
++// GAMES-C: multiplayer delta ingest + replay for the netcode service. Registers
++// nothing unless DCS_MULTIPLAYER_ENABLED=1 and DCS_NETCODE_INGEST_TOKEN (>= 32
++// chars) are set; with the flag off both routes are this server's 404. The
++// permission check is the repository's own read rule: a user may change a world
++// they can read (published, or their own draft).
++const persistenceDelta = registerPersistenceDelta({
++  env: process.env,
++  dataDir: process.env.DCS_PERSISTENCE_DELTA_DIR || path.join(process.env.DCS_DATA_DIR || path.join(process.cwd(), ".dcs-data"), "persistence-delta"),
++  accessWorld: async (worldId: string, userId: string) => {
++    try { await repo.get(worldId, { requesterId: userId }); return "ok"; }
++    catch (e: any) {
++      if (e?.httpStatus === 404) return "not_found";
++      if (e?.httpStatus === 403) return "forbidden";
++      throw e; // upstream failure → the module answers 503 and the netcode retries
++    }
++  },
++});
+ console.log("A3 world store:", repo.kind);
+ 
+ // GAMES-C. The repository stays the head and the authority for "which version
+@@ -754,6 +772,10 @@ const server = http.createServer(async (req, res) => {
+     });
+     }
+ 
++    // GAMES-C: the netcode service authenticates with its own service token, not
++    // a user credential, so this runs BEFORE whoOrNull (which would 401 it).
++    if (await persistenceDelta(req, res, url, method)) return;
++
+     // A1: resolve once. Anonymous is null; a *bad* credential throws 401 here and
+     // never reaches a route, so no handler can be tricked into acting as someone else.
+     const principal = await whoOrNull(req, cid);
+diff --git a/src/v3/gamesc/persistence-delta/index.mjs b/src/v3/gamesc/persistence-delta/index.mjs
+new file mode 100644
+index 0000000..d7fac39
+--- /dev/null
++++ b/src/v3/gamesc/persistence-delta/index.mjs
+@@ -0,0 +1,306 @@
++// backend/persistence-delta/index.mjs — GAMES-C multiplayer delta ingest + replay.
++//
++// An isolated backend module for the DCS Games API (server.mts). It is written
++// to drop in unchanged at src/v3/gamesc/persistence-delta/index.mjs and exposes
++// ONE function, registerPersistenceDelta(), which returns a request handler the
++// host calls before its own routes:
++//
++//   const persistenceDelta = registerPersistenceDelta({ env: process.env, accessWorld, dataDir });
++//   ...
++//   if (await persistenceDelta(req, res, url, method)) return;
++//
++// The handler answers true when it served the request, false otherwise — so
++// with the feature OFF every path falls through to the host's own 404.
++//
++// Routes (only when enabled):
++//   POST /persistence/delta          the netcode service's delta ingest
++//   GET  /persistence/delta/replay   ordered log for one world, for session replay
++//
++// Enabled only when ALL of these hold (fail closed otherwise):
++//   DCS_MULTIPLAYER_ENABLED ∈ {1,true,yes,on}   — multiplayer feature flag (default OFF)
++//   DCS_NETCODE_INGEST_TOKEN, >= 32 chars       — the service bearer the netcode sends
++//   an accessWorld(world_id, user_id) callback  — the host's world permission check
++//
++// Contract (netcode src/persistence-client.ts + src/replay.ts):
++//   POST body {delta_id, op, session_id, world_id, actor_entity_id, actor_user_id,
++//              tick, payload, ts}; Authorization: Bearer <token>; Idempotency-Key: <delta_id>
++//   200 {ok, seq, duplicate}   stored (or already stored — same id, same content)
++//   400 malformed · 401 bad token · 403 actor may not use the world · 404 no such world
++//   409 same delta_id, different content · 413 body too large · 422 world log full
++//   503 storage / permission check unavailable (the netcode retries 5xx)
++//   GET ?world_id=&since=<seq>&limit=<1..1000> → 200 {ok, world_id, deltas, next_since, complete}
++//
++// Storage: append-only JSON lines, one file per world (sha256 of the world id)
++// under dataDir; in memory when no dataDir is given. Appends to one world are
++// serialized; a torn last line (crash mid-write) is skipped on load.
++
++import crypto from "node:crypto";
++import fs from "node:fs/promises";
++import path from "node:path";
++
++const TRUE_FLAGS = new Set(["1", "true", "yes", "on"]);
++const WORLD_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
++const DELTA_ID_RE = /^[A-Za-z0-9-]{8,64}$/;
++const SESSION_ID_RE = /^[A-Za-z0-9-]{1,64}$/;
++const ENTITY_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
++const OBJECT_TYPE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
++const USER_ID_RE = /^[^\s\u0000-\u001f]{1,200}$/;
++const INVENTORY_ACTIONS = new Set(["grant", "equip", "move", "drop"]);
++const MAX_SLOTS = 36;
++const COORD_MAX = 1e6;
++const MIN_TOKEN_LEN = 32;
++
++const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
++const fin = (v) => typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= COORD_MAX;
++const isVec3 = (v) => isObj(v) && fin(v.x) && fin(v.y) && fin(v.z);
++const posInt = (raw, def, min, max) => {
++  const n = Number(raw);
++  return raw === undefined || raw === "" || !Number.isInteger(n) ? def : Math.min(max, Math.max(min, n));
++};
++
++class HttpError extends Error {
++  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
++}
++
++function send(res, status, body) {
++  res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
++  res.end(JSON.stringify(body));
++}
++
++function readRaw(req, max) {
++  return new Promise((resolve, reject) => {
++    const declared = Number(req.headers["content-length"]);
++    if (Number.isFinite(declared) && declared > max) { req.resume(); return reject(new HttpError(413, "payload_too_large", `body exceeds ${max} bytes`)); }
++    const chunks = [];
++    let n = 0, over = false;
++    req.on("data", (c) => { if (over) return; n += c.length; if (n > max) { over = true; chunks.length = 0; return; } chunks.push(c); });
++    req.on("end", () => over ? reject(new HttpError(413, "payload_too_large", `body exceeds ${max} bytes`)) : resolve(Buffer.concat(chunks).toString("utf8")));
++    req.on("error", reject);
++  });
++}
++
++function tokenMatches(header, expected) {
++  if (typeof header !== "string" || !header.startsWith("Bearer ")) return false;
++  const a = crypto.createHash("sha256").update(header.slice(7).trim()).digest();
++  const b = crypto.createHash("sha256").update(expected).digest();
++  return crypto.timingSafeEqual(a, b);
++}
++
++/** Validate a delta envelope and return the normalized record to store (unknown keys dropped). */
++function normalizeDelta(d) {
++  const bad = (msg) => { throw new HttpError(400, "invalid_delta", msg); };
++  if (!isObj(d)) bad("body must be a JSON object");
++  if (typeof d.delta_id !== "string" || !DELTA_ID_RE.test(d.delta_id)) bad("delta_id must match /^[A-Za-z0-9-]{8,64}$/");
++  if (typeof d.world_id !== "string" || !WORLD_ID_RE.test(d.world_id)) bad("world_id must match /^[A-Za-z0-9._:-]{1,200}$/");
++  if (typeof d.session_id !== "string" || !SESSION_ID_RE.test(d.session_id)) bad("bad session_id");
++  if (typeof d.actor_entity_id !== "string" || !ENTITY_ID_RE.test(d.actor_entity_id)) bad("bad actor_entity_id");
++  if (typeof d.actor_user_id !== "string" || !USER_ID_RE.test(d.actor_user_id)) bad("actor_user_id is required (the verified user behind the change)");
++  if (!Number.isInteger(d.tick) || d.tick < 0 || d.tick > 2 ** 31) bad("tick must be a non-negative integer");
++  if (typeof d.ts !== "string" || d.ts.length > 40 || !Number.isFinite(Date.parse(d.ts))) bad("ts must be an ISO timestamp");
++  const p = d.payload;
++  if (!isObj(p)) bad("payload must be an object");
++  let payload;
++  if (d.op === "place") {
++    if (typeof p.entity_id !== "string" || !ENTITY_ID_RE.test(p.entity_id)) bad("place.entity_id");
++    if (typeof p.object_type !== "string" || !OBJECT_TYPE_RE.test(p.object_type)) bad("place.object_type");
++    if (!isVec3(p.position)) bad("place.position must be a finite vec3");
++    if (!isObj(p.rotation) || !fin(p.rotation.yaw)) bad("place.rotation.yaw");
++    payload = { entity_id: p.entity_id, object_type: p.object_type, position: { x: p.position.x, y: p.position.y, z: p.position.z }, rotation: { yaw: p.rotation.yaw } };
++  } else if (d.op === "remove") {
++    if (typeof p.entity_id !== "string" || !ENTITY_ID_RE.test(p.entity_id)) bad("remove.entity_id");
++    payload = { entity_id: p.entity_id };
++  } else if (d.op === "inventory") {
++    if (!INVENTORY_ACTIONS.has(p.action)) bad("inventory.action must be grant|equip|move|drop");
++    if (typeof p.item_id !== "string" || !ENTITY_ID_RE.test(p.item_id)) bad("inventory.item_id");
++    const slot = p.slot ?? null;
++    if (slot !== null && !(Number.isInteger(slot) && slot >= 0 && slot < MAX_SLOTS)) bad(`inventory.slot must be 0..${MAX_SLOTS - 1} or null`);
++    if ((p.action === "grant" || p.action === "equip" || p.action === "move") && slot === null) bad(`inventory.${p.action} needs a slot`);
++    if (p.object_type !== undefined && (typeof p.object_type !== "string" || !OBJECT_TYPE_RE.test(p.object_type))) bad("inventory.object_type");
++    payload = { action: p.action, item_id: p.item_id, slot };
++    if (p.object_type !== undefined) payload.object_type = p.object_type;
++  } else {
++    bad("op must be place|remove|inventory");
++  }
++  return {
++    delta_id: d.delta_id, op: d.op, session_id: d.session_id, world_id: d.world_id,
++    actor_entity_id: d.actor_entity_id, actor_user_id: d.actor_user_id, tick: d.tick, payload, ts: d.ts,
++  };
++}
++
++const contentHash = (rec) => crypto.createHash("sha256").update(JSON.stringify(rec)).digest("hex");
++
++/** Per-world append-only log; file-backed when dir is set. */
++function createStore({ dir, maxPerWorld, maxCachedWorlds }) {
++  const worlds = new Map(); // world_id -> { records, byId: Map<delta_id, {seq, hash}>, chain }
++  const fileOf = (w) => path.join(dir, crypto.createHash("sha256").update(w).digest("hex") + ".jsonl");
++
++  async function load(world_id) {
++    let w = worlds.get(world_id);
++    if (w) { worlds.delete(world_id); worlds.set(world_id, w); return w; } // LRU touch
++    w = { records: [], byId: new Map(), chain: Promise.resolve(), pending: 0 };
++    if (dir) {
++      let text = "";
++      try { text = await fs.readFile(fileOf(world_id), "utf8"); }
++      catch (e) { if (e.code !== "ENOENT") throw e; }
++      // A torn tail has no newline; terminate it so the next append starts a fresh line.
++      if (text && !text.endsWith("\n")) await fs.appendFile(fileOf(world_id), "\n", "utf8");
++      for (const line of text.split("\n")) {
++        if (!line) continue;
++        let r;
++        try { r = JSON.parse(line); } catch { continue; } // torn tail
++        if (!isObj(r) || r.world_id !== world_id || w.byId.has(r.delta_id)) continue;
++        r.seq = w.records.length + 1;
++        w.records.push(r);
++        const { seq, received_at, ...content } = r;
++        w.byId.set(r.delta_id, { seq, hash: contentHash(content) });
++      }
++    }
++    const raced = worlds.get(world_id); // a concurrent load finished first
++    if (raced) return raced;
++    worlds.set(world_id, w);
++    // File mode keeps at most maxCachedWorlds logs in memory; an evicted world is
++    // reloaded from disk on next use. A world with an append in flight is never
++    // evicted (two in-memory copies of one log would disagree on seq). Memory
++    // mode is the log, so it never evicts — it is for dev and tests.
++    if (dir) {
++      for (const [id, ow] of worlds) {
++        if (worlds.size <= maxCachedWorlds) break;
++        if (ow !== w && ow.pending === 0) worlds.delete(id);
++      }
++    }
++    return w;
++  }
++
++  return {
++    kind: dir ? "file" : "memory",
++    async append(rec) {
++      const w = await load(rec.world_id);
++      w.pending++;
++      const run = w.chain.then(async () => {
++        const hash = contentHash(rec);
++        const seen = w.byId.get(rec.delta_id);
++        if (seen) {
++          if (seen.hash !== hash) throw new HttpError(409, "delta_conflict", "this delta_id was stored with different content");
++          return { seq: seen.seq, duplicate: true };
++        }
++        if (w.records.length >= maxPerWorld) throw new HttpError(422, "world_log_full", `world delta log is full (${maxPerWorld})`);
++        const seq = w.records.length + 1;
++        const stored = { ...rec, seq, received_at: new Date().toISOString() };
++        if (dir) {
++          await fs.mkdir(dir, { recursive: true });
++          await fs.appendFile(fileOf(rec.world_id), JSON.stringify(stored) + "\n", "utf8");
++        }
++        w.records.push(stored);
++        w.byId.set(rec.delta_id, { seq, hash });
++        return { seq, duplicate: false };
++      });
++      w.chain = run.catch(() => {}).finally(() => { w.pending--; });
++      return run;
++    },
++    async list(world_id, since, limit) {
++      const w = await load(world_id);
++      await w.chain;
++      const deltas = w.records.slice(since, since + limit);
++      const next_since = since + deltas.length;
++      return { deltas, next_since, complete: next_since >= w.records.length };
++    },
++  };
++}
++
++/**
++ * Register the multiplayer persistence-delta routes.
++ *
++ * @param {object} opts
++ * @param {Record<string,string|undefined>} [opts.env]  process.env (flag, token, limits)
++ * @param {(world_id:string, user_id:string) => Promise<"ok"|"not_found"|"forbidden">} [opts.accessWorld]
++ *        the host's permission check: may this user play (and so change) this world?
++ * @param {string} [opts.dataDir]  directory for the per-world logs (default: env DCS_PERSISTENCE_DELTA_DIR; unset → memory)
++ * @param {{warn:Function,error:Function}} [opts.log]
++ * @returns {((req, res, url:string, method:string) => Promise<boolean>) & { status: {enabled:boolean, reason:string, store?:string} }}
++ */
++export function registerPersistenceDelta(opts = {}) {
++  const env = isObj(opts.env) ? opts.env : {};
++  const log = opts.log || console;
++  const off = (reason) => {
++    const handler = async () => false;
++    handler.status = Object.freeze({ enabled: false, reason });
++    return handler;
++  };
++  if (!TRUE_FLAGS.has(String(env.DCS_MULTIPLAYER_ENABLED ?? "").trim().toLowerCase())) return off("flag_off");
++  const token = String(env.DCS_NETCODE_INGEST_TOKEN ?? "");
++  if (token.length < MIN_TOKEN_LEN) {
++    log.error?.(`[persistence-delta] DCS_NETCODE_INGEST_TOKEN missing or shorter than ${MIN_TOKEN_LEN} chars — routes NOT registered`);
++    return off("token_unset");
++  }
++  const accessWorld = opts.accessWorld;
++  if (typeof accessWorld !== "function") {
++    log.error?.("[persistence-delta] no accessWorld permission check supplied — routes NOT registered");
++    return off("no_access_check");
++  }
++  const maxBytes = posInt(env.DCS_PERSISTENCE_DELTA_MAX_BYTES, 16 * 1024, 1024, 1024 * 1024);
++  const store = createStore({
++    dir: opts.dataDir ?? (env.DCS_PERSISTENCE_DELTA_DIR || null),
++    maxPerWorld: posInt(env.DCS_PERSISTENCE_DELTA_MAX_PER_WORLD, 50_000, 1, 10_000_000),
++    maxCachedWorlds: posInt(env.DCS_PERSISTENCE_DELTA_CACHED_WORLDS, 256, 1, 100_000),
++  });
++
++  async function ingest(req, res) {
++    const raw = await readRaw(req, maxBytes);
++    let body;
++    try { body = JSON.parse(raw); } catch { throw new HttpError(400, "bad_json", "body is not JSON"); }
++    const rec = normalizeDelta(body);
++    const idem = req.headers["idempotency-key"];
++    if (idem !== rec.delta_id) throw new HttpError(400, "idempotency_key", "Idempotency-Key must equal delta_id");
++    let access;
++    try { access = await accessWorld(rec.world_id, rec.actor_user_id); }
++    catch (e) { log.error?.(`[persistence-delta] accessWorld failed: ${e?.message || e}`); throw new HttpError(503, "access_check_unavailable", "world permission check unavailable"); }
++    if (access === "not_found") throw new HttpError(404, "world_not_found", "no such world");
++    if (access !== "ok") throw new HttpError(403, "forbidden", "the actor may not change this world");
++    let r;
++    try { r = await store.append(rec); }
++    catch (e) {
++      if (e instanceof HttpError) throw e;
++      log.error?.(`[persistence-delta] append failed: ${e?.message || e}`);
++      throw new HttpError(503, "storage_unavailable", "delta store unavailable");
++    }
++    send(res, 200, { ok: true, seq: r.seq, duplicate: r.duplicate });
++  }
++
++  async function replay(req, res, query) {
++    const q = new URLSearchParams(query);
++    const world_id = q.get("world_id") || "";
++    if (!WORLD_ID_RE.test(world_id)) throw new HttpError(400, "invalid_world_id", "world_id required");
++    const since = posInt(q.get("since") ?? undefined, 0, 0, Number.MAX_SAFE_INTEGER);
++    const limit = posInt(q.get("limit") ?? undefined, 500, 1, 1000);
++    let page;
++    try { page = await store.list(world_id, since, limit); }
++    catch (e) { log.error?.(`[persistence-delta] list failed: ${e?.message || e}`); throw new HttpError(503, "storage_unavailable", "delta store unavailable"); }
++    send(res, 200, { ok: true, world_id, ...page });
++  }
++
++  const handler = async (req, res, url, method) => {
++    const [p, query = ""] = String(req.url || "").split("?");
++    const pathOnly = url || p;
++    const isIngest = pathOnly === "/persistence/delta";
++    const isReplay = pathOnly === "/persistence/delta/replay";
++    if (!isIngest && !isReplay) return false;
++    try {
++      if ((isIngest && method !== "POST") || (isReplay && method !== "GET")) {
++        res.setHeader("allow", isIngest ? "POST" : "GET");
++        throw new HttpError(405, "method_not_allowed", "method not allowed");
++      }
++      if (!tokenMatches(req.headers.authorization, token)) {
++        if (isIngest) req.resume();
++        throw new HttpError(401, "unauthenticated", "service token required");
++      }
++      if (isIngest) await ingest(req, res);
++      else await replay(req, res, query);
++    } catch (e) {
++      if (e instanceof HttpError) send(res, e.status, { ok: false, error: e.code, message: e.message });
++      else { log.error?.(`[persistence-delta] ${e?.stack || e}`); send(res, 500, { ok: false, error: "internal" }); }
++    }
++    return true;
++  };
++  handler.status = Object.freeze({ enabled: true, reason: "enabled", store: store.kind });
++  return handler;
++}
