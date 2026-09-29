@@ -15,7 +15,7 @@ import { Gateway, mockTokenVerifier, Transport } from './gateway.js';
 import type { OutboundFrame, InboundFrame, C3Delta } from './types.js';
 import { deltaSinkFromEnv } from './persistence-client.js';
 import { verifierFromEnv } from './auth.js';
-import { isValidWorldId } from './validation.js';
+import { isValidWorldId, sanitizeSpawnPoints } from './validation.js';
 import { limitsFromEnv } from './config.js';
 
 // ---- Minimal RFC6455 WebSocket (server side, text frames) ----
@@ -218,15 +218,22 @@ const server = http.createServer((req, res) => {
         json(400, { error: 'max_players must be a positive integer' });
         return;
       }
+      const spawns = sanitizeSpawnPoints(parsed?.spawn_points);
+      if (!spawns.ok) { json(400, { error: spawns.error }); return; }
+      const spawn_seed = parsed?.spawn_seed;
+      if (spawn_seed !== undefined && !(typeof spawn_seed === 'string' && spawn_seed.length > 0 && spawn_seed.length <= 128)) {
+        json(400, { error: 'spawn_seed must be a string of 1..128 chars' });
+        return;
+      }
       let session;
       try {
-        session = sessionManager.createSession(world_id, { maxPlayers: max_players });
+        session = sessionManager.createSession(world_id, { maxPlayers: max_players, spawnPoints: spawns.points, spawnSeed: spawn_seed });
       } catch (err) {
         if (err instanceof SessionCapError) { json(503, { error: 'session cap reached', code: 'capacity' }, { 'retry-after': '30' }); return; }
         json(500, { error: 'could not create session' });
         return;
       }
-      json(200, { session_id: session.session_id, world_id, max_players: session.maxPlayers });
+      json(200, { session_id: session.session_id, world_id, max_players: session.maxPlayers, spawn_points: spawns.points.length });
     });
     return;
   }

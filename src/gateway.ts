@@ -14,7 +14,7 @@ import {
   PartyLeaveFrame,
 } from './types.js';
 import { Session, SessionManager, ClientConn, SessionCapError } from './session.js';
-import { isValidWorldId } from './validation.js';
+import { isValidWorldId, samePosition } from './validation.js';
 
 /**
  * Token verifier seam (synchronous — a join must not wait on the network).
@@ -161,6 +161,14 @@ export class Gateway {
       return;
     }
 
+    // 3c. Initial position is the server's call. A client that states one must
+    //     agree with the assigned spawn (or its preserved position on resume).
+    const spawn = session.assignedSpawn(entity_id);
+    if (frame.position !== undefined && !samePosition(frame.position, spawn.position)) {
+      transport.send({ type: 'error', code: 'invalid', message: 'initial position must equal the assigned spawn' });
+      return;
+    }
+
     // 4. Wire transport into a ClientConn
     const conn: ClientConn = {
       entity_id,
@@ -186,6 +194,7 @@ export class Gateway {
       type: 'joined',
       session_id: session.session_id,
       your_entity_id: entity_id,
+      spawn,
       snapshot,
     });
   }

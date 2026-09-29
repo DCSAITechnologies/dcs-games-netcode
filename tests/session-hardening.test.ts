@@ -1,11 +1,11 @@
 // tests/session-hardening.test.ts
 // DCS Games CW4 Netcode — session hardening (in-memory, no sockets):
 // world_id format + binding, max players per session, session GC + session cap,
-// per-player state cleanup after reconnect grace, config parsing.
+// per-player state cleanup after reconnect grace, spawn points, config parsing.
 
 import { Gateway, mockTokenVerifier, Transport } from '../src/gateway';
 import { Session, SessionManager, SessionFullError, SessionCapError } from '../src/session';
-import { isValidWorldId } from '../src/validation';
+import { isValidWorldId, sanitizeSpawnPoints, MAX_SPAWN_POINTS } from '../src/validation';
 import { limitsFromEnv, intEnv } from '../src/config';
 import type { OutboundFrame } from '../src/types';
 
@@ -174,6 +174,74 @@ async function run(): Promise<boolean> {
   // Invite codes are bounded per session.
   for (let i = 0; i < Session.MAX_INVITES + 50; i++) s7.createInvite();
   check('invite codes bounded per session', (s7 as any).inviteCodes.size === Session.MAX_INVITES);
+
+  // ===== Spawn points =====
+  console.log('\n┌─ Spawn points (seeded, deterministic, validated) ─────┐\n');
+  const SP = [
+    { id: 'north', position: { x: 0, y: 1, z: 40 } },
+    { id: 'south', position: { x: 0, y: 1, z: -40 } },
+    { id: 'east', position: { x: 40, y: 1, z: 0 } },
+    { id: 'west', position: { x: -40, y: 1, z: 0 } },
+  ];
+  check('sanitize: valid list accepted, ids kept', (() => { const r = sanitizeSpawnPoints(SP); return r.ok && r.points.length === 4 && r.points[2].id === 'east'; })());
+  check('sanitize: missing id → spawn_<i>', (() => { const r = sanitizeSpawnPoints([{ position: { x: 1, y: 0, z: 1 } }]); return r.ok && r.points[0].id === 'spawn_0'; })());
+  check('sanitize: out-of-bounds point rejected', !sanitizeSpawnPoints([{ position: { x: 900, y: 0, z: 0 } }]).ok);
+  check('sanitize: NaN / missing position rejected', !sanitizeSpawnPoints([{ position: { x: NaN, y: 0, z: 0 } }]).ok && !sanitizeSpawnPoints([{ id: 'a' }]).ok);
+  check('sanitize: non-array rejected, absent → empty', !sanitizeSpawnPoints({}).ok && (sanitizeSpawnPoints(undefined) as any).points.length === 0);
+  check(`sanitize: more than ${MAX_SPAWN_POINTS} rejected`, !sanitizeSpawnPoints(Array.from({ length: MAX_SPAWN_POINTS + 1 }, () => ({ position: { x: 0, y: 0, z: 0 } }))).ok);
+  check('sanitize: hostile id rejected', !sanitizeSpawnPoints([{ id: '<script>', position: { x: 0, y: 0, z: 0 } }]).ok);
+  let spThrew = false;
+  try { mgr().createSession('w', { spawnPoints: [{ id: 'x', position: { x: 1e6, y: 0, z: 0 } }] }); } catch { spThrew = true; }
+  check('createSession refuses invalid spawn points', spThrew);
+
+  const smS = mgr();
+  const gwS = new Gateway(smS, mockTokenVerifier);
+  const sS = smS.createSession('world-spawn', { spawnPoints: SP, spawnSeed: 'seed-1' });
+  const sS2 = smS.createSession('world-spawn', { spawnPoints: SP, spawnSeed: 'seed-1' });
+  check('same seed + entity → same spawn (deterministic)', JSON.stringify(sS.spawnFor('e_1')) === JSON.stringify(sS2.spawnFor('e_1')));
+  const picks = new Set(Array.from({ length: 40 }, (_, i) => sS.spawnFor(`e_${i}`).id));
+  check('selection spreads players across the provided points', picks.size >= 3, [...picks].join(','));
+  check('every pick is one of the provided points', [...picks].every((id) => SP.some((p) => p.id === id)));
+  const noSp = smS.createSession('w');
+  check('no spawn points → origin fallback', JSON.stringify(noSp.spawnFor('e_1')) === JSON.stringify({ id: 'origin', position: { x: 0, y: 0, z: 0 } }));
+
+  const peer = mkT();
+  gwS.handleFrame(peer.t, { type: 'join', token: 'tok:peer', world_id: 'world-spawn', session_id: sS.session_id });
+  const jA = mkT();
+  gwS.handleFrame(jA.t, { type: 'join', token: 'tok:ann', world_id: 'world-spawn', session_id: sS.session_id });
+  const joinedA = jA.first();
+  const eA = joinedA?.your_entity_id as string;
+  const expected = sS.spawnFor(eA);
+  check('joined frame carries the assigned spawn', joinedA?.type === 'joined' && JSON.stringify(joinedA.spawn) === JSON.stringify(expected));
+  const snapPos = joinedA?.snapshot?.players?.find((p: any) => p.entity_id === eA)?.position;
+  check('authoritative initial position == assigned spawn', JSON.stringify(snapPos) === JSON.stringify(expected.position));
+  const spawnMsg = peer.out.find((f: any) => f.type === 'spawn' && f.entity_id === eA) as any;
+  check('peers get the spawn broadcast at the assigned point', !!spawnMsg && JSON.stringify(spawnMsg.position) === JSON.stringify(expected.position));
+  // First move is validated relative to the spawn, not the origin.
+  gwS.handleFrame(jA.t, { type: 'input', seq: 1, move: { x: 0.3, y: 0, z: 0 }, look: { yaw: 0, pitch: 0 }, dt: 1 / 15 });
+  const moved = sS.snapshot().players.find((p) => p.entity_id === eA)!.position;
+  check('first input moves from the spawn point', Math.abs(moved.x - (expected.position.x + 0.3)) < 1e-6 && moved.z === expected.position.z);
+
+  // Client-claimed initial position must match.
+  const liar = mkT();
+  gwS.handleFrame(liar.t, { type: 'join', token: 'tok:liar', world_id: 'world-spawn', session_id: sS.session_id, position: { x: 400, y: 0, z: 400 } });
+  check('join claiming a different initial position → error invalid', liar.first()?.type === 'error' && liar.first()?.code === 'invalid' && /assigned spawn/.test(liar.first()?.message));
+  const liarCount = sS.playerCount;
+  check('refused claim took no seat', !sS.snapshot().players.some((p) => p.position.x === 400));
+  const honest = mkT();
+  // Compute what the server will assign to 'honest' via a throwaway join-less lookup.
+  const crypto = await import('node:crypto');
+  const honestEid = 'e_' + crypto.createHash('sha256').update(`honest:${sS.session_id}`).digest('hex').slice(0, 12);
+  gwS.handleFrame(honest.t, { type: 'join', token: 'tok:honest', world_id: 'world-spawn', session_id: sS.session_id, position: sS.spawnFor(honestEid).position });
+  check('join claiming exactly the assigned spawn → joined', honest.first()?.type === 'joined' && sS.playerCount === liarCount + 1);
+  const junkClaim = mkT();
+  gwS.handleFrame(junkClaim.t, { type: 'join', token: 'tok:junk', world_id: 'world-spawn', session_id: sS.session_id, position: { x: 'a' } as any });
+  check('malformed claimed position → error invalid', junkClaim.first()?.code === 'invalid');
+  // Resume: assigned position is the preserved one.
+  gwS.handleDisconnect(jA.t);
+  const jA2 = mkT();
+  gwS.handleFrame(jA2.t, { type: 'join', token: 'tok:ann', world_id: 'world-spawn', session_id: sS.session_id, position: moved });
+  check('reconnect: spawn {id:"resume"} at the preserved position; claim of it accepted', jA2.first()?.type === 'joined' && jA2.first()?.spawn?.id === 'resume' && Math.abs(jA2.first()?.spawn?.position.x - moved.x) < 1e-9);
 
   // ===== Config parsing =====
   console.log('\n┌─ Limits from env ─────────────────────────────────────┐\n');

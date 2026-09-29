@@ -3,7 +3,7 @@
 // Anti-cheat day one: no teleport, no speedhack, bounds-checked placement.
 // Clients send intents; server validates BEFORE applying.
 
-import { Vec3, InputFrame, PlaceFrame } from './types.js';
+import { Vec3, InputFrame, PlaceFrame, SpawnPoint } from './types.js';
 
 export interface ValidationResult {
   valid: boolean;
@@ -38,6 +38,43 @@ export const WORLD_ID_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 
 export function isValidWorldId(world_id: unknown): world_id is string {
   return typeof world_id === 'string' && WORLD_ID_RE.test(world_id);
+}
+
+export const MAX_SPAWN_POINTS = 64;
+const SPAWN_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+
+function isVec3(v: unknown): v is Vec3 {
+  const o = v as Vec3;
+  return !!o && typeof o === 'object' && Number.isFinite(o.x) && Number.isFinite(o.y) && Number.isFinite(o.z);
+}
+
+/**
+ * Validate a world's spawn list (as sent to POST /sessions — the shape the
+ * backend shim's sessionConfigFromManifest emits: [{id?, position:{x,y,z}}]).
+ * Every point must be finite and inside WORLD_BOUNDS, or every first move from
+ * it would be rejected. Ids default to spawn_<i>. Positions are copied.
+ */
+export function sanitizeSpawnPoints(raw: unknown): { ok: true; points: SpawnPoint[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, points: [] };
+  if (!Array.isArray(raw)) return { ok: false, error: 'spawn_points must be an array' };
+  if (raw.length > MAX_SPAWN_POINTS) return { ok: false, error: `at most ${MAX_SPAWN_POINTS} spawn_points` };
+  const points: SpawnPoint[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const sp = raw[i] as { id?: unknown; position?: unknown };
+    if (!sp || typeof sp !== 'object') return { ok: false, error: `spawn_points[${i}] must be an object` };
+    if (!isVec3(sp.position)) return { ok: false, error: `spawn_points[${i}].position must be finite {x,y,z}` };
+    if (!inBounds(sp.position)) return { ok: false, error: `spawn_points[${i}].position is outside world bounds` };
+    const id = sp.id === undefined ? `spawn_${i}` : sp.id;
+    if (typeof id !== 'string' || !SPAWN_ID_RE.test(id)) return { ok: false, error: `spawn_points[${i}].id is invalid` };
+    points.push({ id, position: { x: sp.position.x, y: sp.position.y, z: sp.position.z } });
+  }
+  return { ok: true, points };
+}
+
+/** Does a client-claimed initial position equal the assigned one (1mm tolerance)? */
+export function samePosition(a: unknown, b: Vec3, eps = 1e-3): boolean {
+  if (!isVec3(a)) return false;
+  return Math.abs(a.x - b.x) <= eps && Math.abs(a.y - b.y) <= eps && Math.abs(a.z - b.z) <= eps;
 }
 
 function dist(a: Vec3, b: Vec3): number {

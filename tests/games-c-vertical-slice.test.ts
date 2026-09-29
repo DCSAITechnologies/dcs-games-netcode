@@ -203,9 +203,26 @@ async function run(): Promise<boolean> {
     check('health: active_sessions >= 1', (hh.body?.active_sessions ?? 0) >= 1);
 
     const spawnPos = bj?.snapshot?.players?.find((p: any) => p.entity_id === bob.entity_id)?.position;
-    if (spawnPos && spawnPos.x === 0 && spawnPos.y === 0 && spawnPos.z === 0) {
-      note('fresh join always spawns at {0,0,0} (session.ts:163); join frame has no spawn-point field → world-manifest spawn points NOT supported by protocol');
-    }
+    check('session without spawn points: joined.spawn is origin and matches snapshot',
+      bj?.spawn?.id === 'origin' && spawnPos?.x === 0 && spawnPos?.y === 0 && spawnPos?.z === 0);
+
+    // World-provided spawn points over the wire.
+    const SPAWNS = [{ id: 'gate', position: { x: 10, y: 1, z: 10 } }, { id: 'yard', position: { x: -10, y: 1, z: -10 } }];
+    const sp = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: WORLD, spawn_points: SPAWNS }) });
+    check('POST /sessions accepts spawn_points', sp.status === 200 && sp.body?.spawn_points === 2);
+    const spBad = await httpJson(`${base}/sessions`, { method: 'POST', body: JSON.stringify({ world_id: WORLD, spawn_points: [{ position: { x: 9999, y: 0, z: 0 } }] }) });
+    check('POST /sessions rejects out-of-bounds spawn_points → 400', spBad.status === 400);
+    const sc = await mk();
+    sc.send({ type: 'join', token: tok('spawner'), world_id: WORLD, session_id: sp.body?.session_id });
+    const scj = await sc.waitFor((f) => f.type === 'joined');
+    const scPos = scj?.snapshot?.players?.find((p: any) => p.entity_id === scj?.your_entity_id)?.position;
+    check('joined.spawn is one of the world spawn points', SPAWNS.some((s) => s.id === scj?.spawn?.id && JSON.stringify(s.position) === JSON.stringify(scj?.spawn?.position)));
+    check('authoritative start position == joined.spawn', JSON.stringify(scPos) === JSON.stringify(scj?.spawn?.position));
+    const liar = await mk();
+    liar.send({ type: 'join', token: tok('liar'), world_id: WORLD, session_id: sp.body?.session_id, position: { x: 0, y: 0, z: 0 } });
+    const lj = await liar.waitFor((f) => f.type === 'joined' || f.type === 'error');
+    check('join claiming a position other than its spawn → error invalid', lj?.type === 'error' && lj?.code === 'invalid');
+    sc.close(); liar.close();
 
     // ===== Authoritative movement seen by the peer =====
     console.log('\n┌─ Authoritative movement replicated to peer ────────┐\n');

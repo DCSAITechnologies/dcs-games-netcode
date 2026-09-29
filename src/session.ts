@@ -17,6 +17,7 @@ import {
   ChatFrame,
   InventoryFrame,
   C3Delta,
+  SpawnPoint,
 } from './types.js';
 import {
   validateMovement,
@@ -24,6 +25,7 @@ import {
   RateLimiter,
   LIMITS,
   isValidWorldId,
+  sanitizeSpawnPoints,
 } from './validation.js';
 import {
   OwnershipStore,
@@ -67,7 +69,14 @@ export type C3Sink = (delta: C3Delta) => void;
 export interface SessionOptions {
   /** Seats in this session. Reconnect-grace holds keep their seat. Default Session.DEFAULT_MAX_PLAYERS. */
   maxPlayers?: number;
+  /** The world's spawn points (validated by sanitizeSpawnPoints). Empty → origin. */
+  spawnPoints?: SpawnPoint[];
+  /** Seed for spawn selection. Default: the session id. */
+  spawnSeed?: string;
 }
+
+/** Where a fresh player spawns when the world provides no spawn points. */
+export const DEFAULT_SPAWN: SpawnPoint = Object.freeze({ id: 'origin', position: Object.freeze({ x: 0, y: 0, z: 0 }) }) as SpawnPoint;
 
 /** Thrown by Session.join when the session has no free seat. */
 export class SessionFullError extends Error {}
@@ -117,6 +126,8 @@ export class Session {
   // Max players per session when not specified at creation.
   static DEFAULT_MAX_PLAYERS = 16;
   readonly maxPlayers: number;
+  private spawnPoints: SpawnPoint[];
+  private spawnSeed: string;
 
   constructor(world_id: string, c3Sink: C3Sink, session_id?: string, ownership?: OwnershipStore, opts?: SessionOptions) {
     this.world_id = world_id;
@@ -125,6 +136,8 @@ export class Session {
     this.ownership = ownership;
     const mp = opts?.maxPlayers;
     this.maxPlayers = Number.isInteger(mp) && (mp as number) >= 1 ? (mp as number) : Session.DEFAULT_MAX_PLAYERS;
+    this.spawnPoints = (opts?.spawnPoints || []).map((p) => ({ id: p.id, position: { ...p.position } }));
+    this.spawnSeed = opts?.spawnSeed || this.session_id;
   }
 
   // ===== Lifecycle =====
@@ -193,6 +206,28 @@ export class Session {
     return this.players.size + this.disconnected.size < this.maxPlayers;
   }
 
+  /**
+   * Seeded, deterministic spawn selection: the same (seed, entity) always gets
+   * the same point, so a client can be told its spawn before it moves and the
+   * server can hold it to it. No spawn points → DEFAULT_SPAWN (origin).
+   */
+  spawnFor(entity_id: string): SpawnPoint {
+    if (this.spawnPoints.length === 0) return { id: DEFAULT_SPAWN.id, position: { ...DEFAULT_SPAWN.position } };
+    const h = crypto.createHash('sha256').update(`${this.spawnSeed}:${entity_id}`).digest();
+    const sp = this.spawnPoints[h.readUInt32BE(0) % this.spawnPoints.length];
+    return { id: sp.id, position: { ...sp.position } };
+  }
+
+  /**
+   * Where join() will place this entity: its preserved position when it is
+   * reattaching within the grace window, else its spawn point.
+   */
+  assignedSpawn(entity_id: string): SpawnPoint {
+    const held = this.disconnected.get(entity_id)?.player;
+    if (held) return { id: 'resume', position: { ...held.position } };
+    return this.spawnFor(entity_id);
+  }
+
   join(conn: ClientConn): WorldSnapshot {
     if (!this.canAdmit(conn.entity_id)) throw new SessionFullError(`session ${this.session_id} is full (${this.maxPlayers})`);
     this.lastActivityAt = Date.now();
@@ -217,8 +252,8 @@ export class Session {
       return this.snapshot();
     }
 
-    // Fresh join
-    const spawnPos: Vec3 = { x: 0, y: 0, z: 0 };
+    // Fresh join — at the session's assigned spawn point for this entity.
+    const spawnPos: Vec3 = this.spawnFor(conn.entity_id).position;
     const player: PlayerState = {
       entity_id: conn.entity_id,
       position: spawnPos,
@@ -715,7 +750,9 @@ export class SessionManager {
     const cap = this.maxPlayersPerSession;
     const requested = opts?.maxPlayers;
     const maxPlayers = Number.isInteger(requested) && (requested as number) >= 1 ? Math.min(requested as number, cap) : cap;
-    const session = new Session(world_id, this.c3Sink, undefined, this.ownership, { ...opts, maxPlayers });
+    const spawns = sanitizeSpawnPoints(opts?.spawnPoints);
+    if (!spawns.ok) throw new Error(`invalid spawn points: ${spawns.error}`);
+    const session = new Session(world_id, this.c3Sink, undefined, this.ownership, { ...opts, maxPlayers, spawnPoints: spawns.points });
     this.sessions.set(session.session_id, session);
     session.start();
     return session;

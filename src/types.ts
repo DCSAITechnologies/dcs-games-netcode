@@ -17,9 +17,19 @@ export interface Look {
 
 export interface JoinFrame {
   type: 'join';
-  token: string; // CW1 auth token
+  token: string; // auth token (HS256 JWT; `sub` = user id)
   world_id: string;
   session_id?: string; // optional: join existing
+  // Optional: the client's believed initial position. If sent, it MUST equal the
+  // server-assigned spawn (the `joined.spawn` it would receive), else the join is
+  // refused with error 'invalid'. The server never takes a position from the client.
+  position?: Vec3;
+}
+
+/** A spawn point a session may place fresh players at. */
+export interface SpawnPoint {
+  id: string;
+  position: Vec3;
 }
 
 export interface InputFrame {
@@ -121,6 +131,10 @@ export interface JoinedFrame {
   type: 'joined';
   session_id: string;
   your_entity_id: string;
+  // Where the server placed you: a seeded, deterministic pick from the session's
+  // spawn points ({id:'origin'} at {0,0,0} when the world provides none), or
+  // {id:'resume'} at your preserved position when reattaching within grace.
+  spawn: SpawnPoint;
   snapshot: WorldSnapshot;
 }
 
