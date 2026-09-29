@@ -14,6 +14,7 @@ import { SessionManager } from './session.js';
 import { Gateway, mockTokenVerifier, Transport } from './gateway.js';
 import type { OutboundFrame, InboundFrame, C3Delta } from './types.js';
 import { deltaSinkFromEnv } from './persistence-client.js';
+import { verifierFromEnv } from './auth.js';
 
 // ---- Minimal RFC6455 WebSocket (server side, text frames) ----
 
@@ -97,7 +98,13 @@ const persistence = deltaSinkFromEnv();
 const c3Sink = (d: C3Delta) => persistence.emit(d);
 
 const sessionManager = new SessionManager(c3Sink);
-const gateway = new Gateway(sessionManager, mockTokenVerifier);
+// Auth: HS256 JWT (NETCODE_JWT_SECRET) or fail closed. The mock verifier is
+// reachable only with NETCODE_ALLOW_MOCK_AUTH=1 outside production.
+const auth = verifierFromEnv(process.env, mockTokenVerifier);
+if (auth.mode === 'deny-all') console.error(`[auth] ${auth.warning}`);
+else if (auth.warning) console.warn(`[auth] ${auth.warning}`);
+else console.log('[auth] HS256 JWT verification enabled');
+const gateway = new Gateway(sessionManager, auth.verifier);
 
 const server = http.createServer((req, res) => {
   if (req.method === 'POST' && req.url === '/sessions') {
@@ -141,6 +148,7 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({
       ok: true,
       active_sessions: sessionManager.activeSessionCount,
+      auth: auth.mode,
       persistence: { mode: process.env.CW5_PERSISTENCE_URL ? 'live' : 'local', deltas_emitted: persistence.count },
     }));
     return;

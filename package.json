@@ -10,7 +10,7 @@
     "start": "node dist/server.js",
     "server": "node dist/server.js",
     "server:dev": "tsx src/server.ts",
-    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke && npm run test:speedhack && npm run test:gamesc-slice",
+    "test": "npm run test:mp0 && npm run test:mp1 && npm run test:mp2 && npm run test:inventory && npm run test:party && npm run test:reconnect && npm run test:delta && npm run test:lagcomp && npm run test:aoi && npm run test:persistence && npm run test:movement && npm run test:smoke && npm run test:speedhack && npm run test:gamesc-slice && npm run test:auth",
     "test:mp0": "tsx tests/mp0-acceptance.test.ts",
     "test:mp1": "tsx tests/mp1-acceptance.test.ts",
     "test:mp2": "tsx tests/mp2-conformance.test.ts",
@@ -24,7 +24,8 @@
     "test:movement": "tsx tests/movement-regression.test.ts",
     "test:smoke": "node tests/mock-server-smoke.mjs",
     "test:speedhack": "tsx tests/speedhack-regression.test.ts",
-    "test:gamesc-slice": "tsx tests/games-c-vertical-slice.test.ts"
+    "test:gamesc-slice": "tsx tests/games-c-vertical-slice.test.ts",
+    "test:auth": "tsx tests/auth-jwt.test.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

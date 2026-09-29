@@ -19,6 +19,7 @@
 import { spawn, ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
+import { signHs256Jwt } from '../src/auth';
 
 let pass = 0, fail = 0;
 const notes: string[] = [];
@@ -29,6 +30,10 @@ const note = (n: string) => { notes.push(n); console.log('📝 NOTE: ' + n); };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const WORLD = 'world-gamesc-slice';
+// The real server now fails closed without a secret; the slice runs it with a
+// test secret and mints real HS256 tokens (sub = user id), as the backend would.
+const JWT_SECRET = 'slice-test-secret-0123456789abcdef0123456789';
+const tok = (sub: string) => signHs256Jwt(JWT_SECRET, { sub, iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 600 });
 
 function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -44,7 +49,8 @@ function freePort(): Promise<number> {
 
 function bootServer(port: number): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
-    const env = { ...process.env, PORT: String(port) };
+    const env: Record<string, string | undefined> = { ...process.env, PORT: String(port), NETCODE_JWT_SECRET: JWT_SECRET };
+    delete env.NETCODE_ALLOW_MOCK_AUTH;
     delete env.CW5_PERSISTENCE_URL;
     delete env.CW5_PERSISTENCE_TOKEN;
     const tsx = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
@@ -136,6 +142,7 @@ async function run(): Promise<boolean> {
     console.log('┌─ HTTP: health + session issuance ───────────────────┐\n');
     const h = await httpJson(`${base}/health`);
     check('GET /health → ok:true', h.status === 200 && h.body?.ok === true);
+    check('health reports auth mode hs256', h.body?.auth === 'hs256');
     check('health reports local persistence (offline)', h.body?.persistence?.mode === 'local');
     const bad = await httpJson(`${base}/sessions`, { method: 'POST', body: '{}' });
     check('POST /sessions without world_id → 400', bad.status === 400);
@@ -159,9 +166,15 @@ async function run(): Promise<boolean> {
     await sleep(100);
     check('server closes socket after auth failure', anon.closed);
 
+    const mocky = await mk();
+    m = mocky.mark();
+    mocky.send({ type: 'join', token: 'tok:alice', world_id: WORLD, session_id: sessionId });
+    const mockErr = await mocky.waitFor((f) => f.type === 'error', m);
+    check('unsigned mock token "tok:alice" rejected on the real server', mockErr?.code === 'auth');
+
     const ghost = await mk();
     m = ghost.mark();
-    ghost.send({ type: 'join', token: 'tok:ghost', world_id: WORLD, session_id: 'no-such-session' });
+    ghost.send({ type: 'join', token: tok('ghost'), world_id: WORLD, session_id: 'no-such-session' });
     const nf = await ghost.waitFor((f) => f.type === 'error', m);
     check('join unknown session_id → error not_found', nf?.code === 'not_found');
     ghost.close();
@@ -169,7 +182,7 @@ async function run(): Promise<boolean> {
     // ===== Two clients, one session =====
     console.log('\n┌─ Two clients join the same session ─────────────────┐\n');
     const alice = await mk();
-    alice.send({ type: 'join', token: 'tok:alice', world_id: WORLD, session_id: sessionId });
+    alice.send({ type: 'join', token: tok('alice'), world_id: WORLD, session_id: sessionId });
     const aj = await alice.waitFor((f) => f.type === 'joined');
     alice.entity_id = aj?.your_entity_id ?? null;
     check('alice joined (joined frame + entity id)', !!alice.entity_id && aj?.session_id === sessionId);
@@ -177,7 +190,7 @@ async function run(): Promise<boolean> {
 
     const bob = await mk();
     const aMark = alice.mark();
-    bob.send({ type: 'join', token: 'tok:bob', world_id: WORLD, session_id: sessionId });
+    bob.send({ type: 'join', token: tok('bob'), world_id: WORLD, session_id: sessionId });
     const bj = await bob.waitFor((f) => f.type === 'joined');
     bob.entity_id = bj?.your_entity_id ?? null;
     check('bob joined same session', !!bob.entity_id && bj?.session_id === sessionId);
@@ -292,7 +305,7 @@ async function run(): Promise<boolean> {
 
     // Party / inventory on the DEPLOYED entrypoint.
     bMark = bob.mark();
-    bob.send({ type: 'party_create', token: 'tok:bob', world_id: WORLD });
+    bob.send({ type: 'party_create', token: tok('bob'), world_id: WORLD });
     const party = await bob.waitFor((f) => f.type === 'error' || f.type === 'party_state', bMark);
     if (party?.type === 'error') note(`party frames on src/server.ts: "${party.message}" — server.ts:100 builds Gateway without presence/party`);
     bMark = bob.mark();
@@ -302,7 +315,7 @@ async function run(): Promise<boolean> {
 
     // World-id mismatch probe.
     const mis = await mk();
-    mis.send({ type: 'join', token: 'tok:mallory', world_id: 'some-other-world', session_id: sessionId });
+    mis.send({ type: 'join', token: tok('mallory'), world_id: 'some-other-world', session_id: sessionId });
     const mj = await mis.waitFor((f) => f.type === 'joined' || f.type === 'error');
     if (mj?.type === 'joined') note('join with world_id != session.world_id is ACCEPTED (gateway.ts:104-109 never compares world_id); no max-players cap either');
     mis.close();
@@ -318,7 +331,7 @@ async function run(): Promise<boolean> {
 
     const alice2 = await mk();
     bMark = bob.mark();
-    alice2.send({ type: 'join', token: 'tok:alice', world_id: WORLD, session_id: sessionId });
+    alice2.send({ type: 'join', token: tok('alice'), world_id: WORLD, session_id: sessionId });
     const rj = await alice2.waitFor((f) => f.type === 'joined');
     check('reconnect → SAME entity id (deterministic sha256(user:session))', rj?.your_entity_id === alice.entity_id);
     const rpos = rj?.snapshot?.players?.find((p: any) => p.entity_id === alice.entity_id)?.position;

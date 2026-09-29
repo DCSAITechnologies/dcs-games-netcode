@@ -16,10 +16,18 @@ import {
 import { Session, SessionManager, ClientConn } from './session.js';
 
 /**
- * CW1 token verifier. In production this calls CW1's identity service.
- * For P0/headless test, inject a mock that accepts well-formed tokens.
+ * Token verifier seam (synchronous — a join must not wait on the network).
+ * The real server uses the HS256 JWT verifier from ./auth.ts (see verifierFromEnv);
+ * headless/in-memory tests inject mockTokenVerifier.
+ * `claims`, when present, are the verified token claims; a token that carries
+ * `world_id` / `session_id` claims is bound to them (see handleJoin).
  */
-export type TokenVerifier = (token: string) => { valid: boolean; user_id?: string };
+export type TokenVerifier = (token: string) => {
+  valid: boolean;
+  user_id?: string;
+  reason?: string;
+  claims?: Record<string, unknown>;
+};
 
 /**
  * A raw transport connection (before it's bound to a session entity).
@@ -90,6 +98,16 @@ export class Gateway {
     const auth = this.verifyToken(frame.token);
     if (!auth.valid) {
       transport.send({ type: 'error', code: 'auth', message: 'invalid token' });
+      transport.close();
+      return;
+    }
+    // 1b. A token minted for one world/session (a backend "ticket") cannot be
+    //     replayed into another. Plain Supabase access tokens carry neither claim.
+    const claimWorld = auth.claims?.world_id;
+    const claimSession = auth.claims?.session_id;
+    if ((typeof claimWorld === 'string' && claimWorld !== frame.world_id) ||
+        (typeof claimSession === 'string' && claimSession !== frame.session_id)) {
+      transport.send({ type: 'error', code: 'auth', message: 'token is not valid for this world/session' });
       transport.close();
       return;
     }
@@ -243,9 +261,10 @@ export class Gateway {
 }
 
 /**
- * Default mock token verifier for P0/headless testing.
- * Accepts tokens of the form "tok:<user_id>"; rejects everything else.
- * Replace with a real CW1 call when identity service is live.
+ * Mock token verifier — TESTS AND LOCAL DEV ONLY.
+ * Accepts unsigned tokens of the form "tok:<user_id>"; rejects everything else.
+ * The real server never uses this unless NETCODE_ALLOW_MOCK_AUTH=1 and
+ * NODE_ENV !== 'production' (see verifierFromEnv in ./auth.ts).
  */
 export const mockTokenVerifier: TokenVerifier = (token: string) => {
   if (typeof token === 'string' && token.startsWith('tok:')) {
