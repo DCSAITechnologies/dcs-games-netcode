@@ -131,6 +131,35 @@ function createFrameDecoder(maxPayload: number): (chunk: Buffer) => DecodedMessa
 }
 
 /**
+ * Close a connection that has just been answered 413 without losing the answer.
+ * Destroying the socket while the client is still sending leaves unread bytes in
+ * the kernel buffer, so the close goes out as a RST — and a RST that overtakes
+ * the 413 wipes it from the client's receive buffer (it sees ECONNRESET, never
+ * the status). So: send FIN after the response, discard whatever is still in
+ * flight, and destroy after a short, bounded linger.
+ */
+const LINGER_MS = 500;
+const LINGER_MAX_BYTES = 256 * 1024;
+function closeAfter413(req: http.IncomingMessage, res: http.ServerResponse) {
+  res.on('finish', () => {
+    const socket = req.socket;
+    // Node's own finish handler (registered first) answers `connection: close`
+    // with socket.destroySoon(), which destroys on the socket's 'finish' — the
+    // same RST. Take that over; if the internals ever differ this is a no-op and
+    // the bounded timer below still closes the socket.
+    socket.removeListener('finish', socket.destroy);
+    let drained = 0;
+    const timer = setTimeout(() => socket.destroy(), LINGER_MS);
+    timer.unref();
+    socket.once('close', () => clearTimeout(timer));
+    req.removeAllListeners('data');
+    req.on('data', (c: Buffer) => { drained += c.length; if (drained > LINGER_MAX_BYTES) socket.destroy(); });
+    req.resume();
+    socket.end();
+  });
+}
+
+/**
  * Read a request body up to `max` bytes. Resolves the body, or null after it has
  * already answered 413 and arranged for the connection to close. Never buffers
  * more than `max` bytes: a declared Content-Length over the cap is refused
@@ -143,7 +172,7 @@ function readBody(req: http.IncomingMessage, res: http.ServerResponse, max: numb
         res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
         res.end(JSON.stringify({ error: 'body too large', max_bytes: max }));
       }
-      res.on('finish', () => req.socket.destroy());
+      closeAfter413(req, res);
       resolve(null);
     };
     const declared = Number(req.headers['content-length']);
@@ -265,7 +294,7 @@ const server = http.createServer((req, res) => {
   if (Number.isFinite(declared) && declared > limits.maxHttpBody) {
     res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
     res.end(JSON.stringify({ error: 'body too large', max_bytes: limits.maxHttpBody }));
-    res.on('finish', () => req.socket.destroy());
+    closeAfter413(req, res);
     return;
   }
 

@@ -179,6 +179,24 @@ async function run(): Promise<boolean> {
     pump();
   });
   check('streamed (chunked, no length) body over cap → 413 + connection: close', streamed.status === 413 && streamed.closed, JSON.stringify(streamed));
+  // The 413 must survive a client that is still sending. Destroying the socket
+  // with unread bytes sends a RST that can overtake the answer; before the
+  // lingering close about 1 in 9 of these lost the 413 entirely.
+  let flooded = 0;
+  const floodBody = Buffer.alloc(4 * 1024 * 1024, 122);
+  for (let i = 0; i < 20; i++) {
+    const saw = await new Promise<boolean>((resolve) => {
+      const s = net.connect(A.port, '127.0.0.1');
+      let got = '';
+      s.on('data', (d) => { got += d; });
+      s.on('error', () => {});
+      s.on('close', () => resolve(got.startsWith('HTTP/1.1 413')));
+      s.write(`POST /sessions HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: ${floodBody.length}\r\n\r\n`);
+      s.write(floodBody);
+    });
+    if (saw) flooded++;
+  }
+  check('declared body over cap, client still sending → the 413 always arrives (20/20)', flooded === 20, `${flooded}/20`);
   const hA2 = await httpJson(`${base}/health`);
   check('server healthy after oversized bodies', hA2.body?.ok === true);
 
